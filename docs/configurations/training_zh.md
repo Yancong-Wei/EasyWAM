@@ -49,7 +49,8 @@ python scripts/precompute_text_embeds.py task=libero_easywam_mot_wan22
 | `weight_decay` | `0.0` | AdamW weight decay；仓库 task 通常会覆盖。 |
 | `lr_scheduler_type` | `cosine` | Trainer 学习率 schedule。 |
 | `warmup_ratio` | `0.05` | Warmup 步数比例，必须位于 `[0, 1)`。 |
-| `max_steps` | `1000` | 必填正数的优化步数上限；项目不使用基于 epoch 的训练。 |
+| `max_steps` | `1000` | 优化步数上限；未设置 `max_epochs` 时必填。 |
+| `max_epochs` | `null` | 可选的数据量（按完整遍历训练集的次数）。设置后 Trainer 会用数据集大小和全局 batch（单进程 batch × 进程数 × 梯度累积）推导 `max_steps`。 |
 | `mixed_precision` | `bf16` | 可选值为 `no`、`fp16` 或 `bf16`。 |
 | `max_grad_norm` | `1.0` | 梯度裁剪阈值。 |
 | `seed` | `42` | 训练和 DataLoader worker 随机种子。 |

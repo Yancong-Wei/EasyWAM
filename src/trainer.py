@@ -1,6 +1,7 @@
 import logging
 import json
 import inspect
+import math
 import os
 import re
 from contextlib import nullcontext
@@ -12,7 +13,7 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedType
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -26,6 +27,10 @@ from utils.video_io import save_mp4
 from utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
 logger = get_logger(__name__)
+
+
+def _cfg_none(value) -> bool:
+    return value is None or OmegaConf.is_none(value)
 
 
 class DataLoaderWorkerInit:
@@ -89,12 +94,6 @@ class EasyWAMTrainer:
         self.dataloader_persistent_workers = bool(cfg.get("dataloader_persistent_workers", True))
         self.dataloader_pin_memory = bool(cfg.get("dataloader_pin_memory", torch.cuda.is_available()))
         self.dataloader_worker_threads = int(cfg.get("dataloader_worker_threads", 1))
-        max_steps = cfg.max_steps
-        if max_steps is None:
-            raise ValueError("`max_steps` must be set explicitly; epoch-based training is not used.")
-        self.max_steps = int(max_steps)
-        if self.max_steps <= 0:
-            raise ValueError(f"`max_steps` must be > 0, got {self.max_steps}.")
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
@@ -150,6 +149,7 @@ class EasyWAMTrainer:
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
+        self._resolve_train_schedule()
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional state encoder) as trainable when ZeRO builds optimizer state.
@@ -221,6 +221,74 @@ class EasyWAMTrainer:
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
+
+    def _global_batch_size(self) -> int:
+        return (
+            self.batch_size
+            * int(self.accelerator.num_processes)
+            * self.gradient_accumulation_steps
+        )
+
+    def _resolve_train_schedule(self) -> None:
+        dataset_size = len(self.train_dataset)
+        if dataset_size <= 0:
+            raise ValueError(
+                f"`train_dataset` must be non-empty, got length {dataset_size}."
+            )
+        global_batch = self._global_batch_size()
+        if global_batch <= 0:
+            raise ValueError(f"Global batch must be > 0, got {global_batch}.")
+
+        self.dataset_size = dataset_size
+        self.global_batch_size = global_batch
+        self.steps_per_epoch = max(1, math.ceil(dataset_size / global_batch))
+
+        max_epochs_cfg = self.cfg.get("max_epochs", None)
+        max_steps_cfg = self.cfg.get("max_steps", None)
+        has_epochs = not _cfg_none(max_epochs_cfg)
+        has_steps = not _cfg_none(max_steps_cfg)
+
+        if has_epochs:
+            planned_epochs = float(max_epochs_cfg)
+            if planned_epochs <= 0:
+                raise ValueError(f"`max_epochs` must be > 0, got {planned_epochs}.")
+            derived_steps = max(
+                1, math.ceil(planned_epochs * dataset_size / global_batch)
+            )
+            if has_steps:
+                logger.info(
+                    "`max_epochs`=%.4f overrides `max_steps`=%s with derived max_steps=%d.",
+                    planned_epochs,
+                    max_steps_cfg,
+                    derived_steps,
+                )
+            self.max_steps = derived_steps
+            self.planned_epochs = planned_epochs
+        elif has_steps:
+            self.max_steps = int(max_steps_cfg)
+            if self.max_steps <= 0:
+                raise ValueError(f"`max_steps` must be > 0, got {self.max_steps}.")
+            self.planned_epochs = self.max_steps * global_batch / dataset_size
+        else:
+            raise ValueError("Set `max_steps` or `max_epochs`.")
+
+        logger.info(
+            "Train schedule: samples=%d global_batch=%d "
+            "(per_device=%d world=%d accum=%d) steps_per_epoch=%d "
+            "max_steps=%d planned_epochs=%.4f",
+            dataset_size,
+            global_batch,
+            self.batch_size,
+            int(self.accelerator.num_processes),
+            self.gradient_accumulation_steps,
+            self.steps_per_epoch,
+            self.max_steps,
+            self.planned_epochs,
+        )
+
+    def _epoch_progress(self) -> tuple[float, float]:
+        current = self.global_step * self.global_batch_size / self.dataset_size
+        return current, float(self.planned_epochs)
 
     def _log_prepared_runtime(self):
         if not self.is_deepspeed:
@@ -970,7 +1038,12 @@ class EasyWAMTrainer:
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
-        logger.info("Starting training with max_steps=%d.", self.max_steps)
+        logger.info(
+            "Starting training with max_steps=%d planned_epochs=%.4f steps_per_epoch=%d.",
+            self.max_steps,
+            self.planned_epochs,
+            self.steps_per_epoch,
+        )
         data_iter = iter(self.train_loader)
         progress_bar = tqdm(
             total=self.max_steps,
@@ -1028,9 +1101,11 @@ class EasyWAMTrainer:
                 self.global_step += 1
                 checkpoint_saved_at_current_step = False
                 current_lr = float(self.optimizer.param_groups[0]["lr"])
+                current_epoch, planned_epochs = self._epoch_progress()
                 if self.accelerator.is_local_main_process:
                     progress_bar.set_postfix(
                         {
+                            "epoch": f"{current_epoch:.3f}/{planned_epochs:.3f}",
                             "data_time": f"{data_time:.4f}",
                             "forward_time": f"{forward_time:.4f}",
                             "backward_time": f"{backward_time:.4f}",
@@ -1052,12 +1127,13 @@ class EasyWAMTrainer:
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
                 if should_log and self.accelerator.is_main_process:
                     description = (
-                        "[train] epoch=%d step=%d/%d loss_avg=%.6f "
+                        "[train] epoch=%.4f/%.4f step=%d/%d loss_avg=%.6f "
                         "loss_action_avg=%.6f loss_video_avg=%.6f "
                         "weighted_loss_action_avg=%.6f weighted_loss_video_avg=%.6f lr=%.4e "
                         "data_time=%.4fs forward_time=%.4fs backward_time=%.4fs"
                     ) % (
-                        self.epoch,
+                        current_epoch,
+                        planned_epochs,
                         self.global_step,
                         self.max_steps,
                         loss_averages["loss_avg"],
@@ -1079,6 +1155,8 @@ class EasyWAMTrainer:
                     logger.info(description)
 
                     wandb_payload = {
+                        "train/epoch": current_epoch,
+                        "train/planned_epochs": planned_epochs,
                         "train/loss_avg": loss_averages["loss_avg"],
                         "train/loss_action_avg": loss_averages["loss_action_avg"],
                         "train/loss_video_avg": loss_averages["loss_video_avg"],

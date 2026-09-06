@@ -49,7 +49,8 @@ Models sharing the same `text_encoder_id` and compatible context length can shar
 | `weight_decay` | `0.0` | AdamW weight decay; checked-in tasks commonly override it. |
 | `lr_scheduler_type` | `cosine` | Trainer learning-rate schedule. |
 | `warmup_ratio` | `0.05` | Fraction of steps used for warmup; must be in `[0, 1)`. |
-| `max_steps` | `1000` | Required positive optimizer-step limit; epoch-based training is not used. |
+| `max_steps` | `1000` | Optimizer-step limit. Required unless `max_epochs` is set. |
+| `max_epochs` | `null` | Optional data budget in dataset passes. When set, the trainer derives `max_steps` from dataset size and global batch (`per-device batch × world size × accumulation`). |
 | `mixed_precision` | `bf16` | One of `no`, `fp16`, or `bf16`. |
 | `max_grad_norm` | `1.0` | Gradient clipping threshold. |
 | `seed` | `42` | Training and worker seed. |
