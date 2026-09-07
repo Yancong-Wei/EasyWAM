@@ -30,7 +30,11 @@ logger = get_logger(__name__)
 
 
 def _cfg_none(value) -> bool:
-    return value is None or OmegaConf.is_none(value)
+    if value is None:
+        return True
+    # OmegaConf.is_none exists in 2.4+; 2.3 stores YAML null as Python None.
+    is_none = getattr(OmegaConf, "is_none", None)
+    return bool(is_none(value)) if callable(is_none) else False
 
 
 class DataLoaderWorkerInit:
