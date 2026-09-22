@@ -17,11 +17,6 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from tqdm import tqdm
 
-# try:
-#     import rootutils
-
-#     rootutils.setup_root(__file__, indicator=".python-version", pythonpath=True)
-# except ModuleNotFoundError:
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(PROJECT_ROOT) not in sys.path:
@@ -64,6 +59,7 @@ class LiberoEvalRuntime:
     input_h: int
     model_device: str
     prompt_cache: PromptContextCache
+    batcher: Any = None
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -134,39 +130,6 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     model.load_checkpoint(ckpt, merge_lora=True)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
-    return
-
-    # deprecated legacy checkpoint loading
-    payload = torch.load(ckpt, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError(f"Legacy checkpoint payload must be dict, got: {type(payload)}")
-
-    if "mot" in payload and hasattr(model, "mot"):
-        missing, unexpected = model.mot.load_state_dict(payload["mot"], strict=False)
-        logging.warning(
-            "Loaded fallback `mot` state_dict with strict=False. Missing=%d Unexpected=%d",
-            len(missing),
-            len(unexpected),
-        )
-        return
-
-    state_dict = None
-    for key in ("model_state_dict", "state_dict", "model"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            state_dict = value
-            break
-    if state_dict is None and all(torch.is_tensor(v) for v in payload.values()):
-        state_dict = payload
-    if state_dict is None:
-        raise ValueError(f"Cannot parse legacy checkpoint keys from: {ckpt}")
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    logging.warning(
-        "Loaded fallback model state_dict with strict=False. Missing=%d Unexpected=%d",
-        len(missing),
-        len(unexpected),
-    )
 
 
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -397,22 +360,17 @@ def _predict_action_chunk(
         num_inference_steps = int(num_inference_steps_cfg)
     prompt_template = DEFAULT_PROMPT
     prompt = prompt_template.format(task=task_description)
-    context, context_mask = prompt_cache.get(prompt)
-
     image, proprio, imgs = _obs_to_model_input(
         obs,
         cfg=cfg,
         processor=processor,
         width=input_w,
         height=input_h,
-        device=model_device,
-        dtype=model.torch_dtype,
+        device="cpu" if isinstance(model, LiberoEvalRuntime) else model_device,
+        dtype=torch.float32 if isinstance(model, LiberoEvalRuntime) else model.torch_dtype,
     )
 
     infer_kwargs = {
-        "prompt": None,
-        "context": context,
-        "context_mask": context_mask,
         "input_image": image,
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
@@ -431,16 +389,32 @@ def _predict_action_chunk(
     predicted_future_frames = None
     if visualize_future_video:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
-    elif bool(getattr(model, "_eval_supports_num_video_frames", False)):
+    elif bool(getattr(
+        model.model if isinstance(model, LiberoEvalRuntime) else model,
+        "_eval_supports_num_video_frames",
+        False,
+    )):
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
 
     infer_started = time.perf_counter()
-    with torch.inference_mode():
+    if isinstance(model, LiberoEvalRuntime):
+        pred = model.batcher.submit(
+            "joint" if visualize_future_video else "action",
+            prompt=prompt,
+            **infer_kwargs,
+        )
+        timing["prompt_encode_seconds"] += float(pred.get("prompt_encode_seconds", 0.0))
         if visualize_future_video:
-            pred = model.infer_joint(**infer_kwargs)
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
-        else:
-            pred = model.infer_action(**infer_kwargs)
+    else:
+        context, context_mask = prompt_cache.get(prompt)
+        infer_kwargs.update(prompt=None, context=context, context_mask=context_mask)
+        with torch.inference_mode():
+            if visualize_future_video:
+                pred = model.infer_joint(**infer_kwargs)
+                predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            else:
+                pred = model.infer_action(**infer_kwargs)
     timing["inference_seconds"] += time.perf_counter() - infer_started
     action = pred["action"]  # [T, D]
 
@@ -649,7 +623,8 @@ def run_single_task(
     model_device: str,
     prompt_cache: PromptContextCache,
 ) -> dict:
-    prompt_cache.clear()
+    if not isinstance(model, LiberoEvalRuntime):
+        prompt_cache.clear()
     timing = {
         "environment_initialize_seconds": 0.0,
         "prompt_encode_seconds": 0.0,
@@ -682,7 +657,15 @@ def run_single_task(
         raise ValueError(f"No initial states available for task {cfg.EVALUATION.task_id}.")
 
     try:
-        for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+        num_trials = int(cfg.EVALUATION.num_trials)
+        suite_name = str(cfg.EVALUATION.task_suite_name)
+        task_id = int(cfg.EVALUATION.task_id)
+        for trial_idx in range(num_trials):
+            trial_started = time.perf_counter()
+            logging.info(
+                "[%s:%d] Trial %d/%d started",
+                suite_name, task_id, trial_idx + 1, num_trials,
+            )
             initial_state = initial_states[trial_idx % len(initial_states)]
             success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
                 env=env,
@@ -704,6 +687,12 @@ def run_single_task(
                 results["success_episodes"].append(trial_idx)
             else:
                 results["failure_episodes"].append(trial_idx)
+            logging.info(
+                "[%s:%d] Trial %d/%d completed: success=%s cumulative=%d/%d duration=%.2fs",
+                suite_name, task_id, trial_idx + 1, num_trials, success,
+                results["successes"], trial_idx + 1,
+                time.perf_counter() - trial_started,
+            )
             if visualize_future_video:
                 results["episode_future_video_psnr"].append(episode_mean_psnr)
 
@@ -753,7 +742,8 @@ def run_single_task(
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
-    timing["prompt_encode_seconds"] = prompt_cache.encode_seconds - prompt_encode_before
+    if not isinstance(model, LiberoEvalRuntime):
+        timing["prompt_encode_seconds"] = prompt_cache.encode_seconds - prompt_encode_before
     if bool(cfg.EVALUATION.get("timing_enabled", False)):
         results["timing"] = timing
     return results
@@ -783,7 +773,7 @@ def build_eval_runtime(cfg: DictConfig) -> LiberoEvalRuntime:
     model = model.to(model_device).eval()
     model = configure_inference_compile_from_config(model, cfg.EVALUATION)
     model._eval_supports_num_video_frames = (
-        "num_video_frames" in inspect.signature(model.infer_action).parameters
+        "num_video_frames" in inspect.signature(model.infer_action_batch).parameters
     )
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
@@ -843,6 +833,10 @@ def evaluate_task_with_runtime(
         task_suite = benchmark.get_benchmark_dict()[suite_name]()
     task = task_suite.get_task(task_id)
     initial_states = task_suite.get_task_init_states(task_id)
+    logging.info(
+        "Task started: suite=%s task_id=%d name=%s trials=%d",
+        suite_name, task_id, getattr(task, "name", None), int(cfg.EVALUATION.num_trials),
+    )
 
     results: dict[str, Any] = {
         "task_suite": suite_name,
@@ -863,7 +857,7 @@ def evaluate_task_with_runtime(
     task_results = run_single_task(
         task=task,
         initial_states=initial_states,
-        model=runtime.model,
+        model=runtime if runtime.batcher is not None else runtime.model,
         processor=runtime.processor,
         cfg=cfg,
         video_dir=video_dir,
@@ -876,6 +870,11 @@ def evaluate_task_with_runtime(
     )
     results.update(task_results)
     results["duration"] = time.time() - start_time
+    logging.info(
+        "Task completed: suite=%s task_id=%d successes=%d/%d duration=%.2fs",
+        suite_name, task_id, results["successes"], results["total_episodes"],
+        results["duration"],
+    )
     return results
 
 
@@ -892,7 +891,11 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+@hydra.main(
+    version_base="1.3",
+    config_path="../../configs",
+    config_name="benchmark/sim_libero.yaml",
+)
 def eval_single_process(cfg: DictConfig):
     if cfg.get("seed") is not None:
         set_global_seed(int(cfg.seed), get_worker_init_fn=False)

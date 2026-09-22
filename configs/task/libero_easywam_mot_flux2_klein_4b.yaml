@@ -1,19 +1,16 @@
 # @package _global_
 
 defaults:
-  - override /data: libero_2cam
+  - override /data: libero
   - override /model: easywam_mot_flux2_klein_4b
   - _self_
 
 data:
   train:
-    text_embedding_cache_dir: ???
     # Match the released ImageWAM LIBERO policy contract.
     num_frames: 17
     action_video_freq_ratio: 1
     context_len: 128
-  val:
-    text_embedding_cache_dir: ???
 
 model:
   backbone:

@@ -14,9 +14,36 @@ from ..backbone.wan22.wan_video_dit import (
     sinusoidal_embedding_1d,
     precompute_freqs_cis,
 )
-from .attention import elide_fully_valid_attention_mask, require_attention_backend
+from .attention import KeyPaddingMask, elide_fully_valid_attention_mask, require_attention_backend
 
 logger = get_logger(__name__)
+
+STATE_POSITIONS = ("context", "sequence")
+
+
+def normalize_state_position(value: str) -> str:
+    position = str(value).strip().lower()
+    if position not in STATE_POSITIONS:
+        raise ValueError(
+            f"Unsupported state_position: {value!r}. Expected one of {STATE_POSITIONS}."
+        )
+    return position
+
+
+def validate_checkpoint_state_position(payload: dict, current_position: str) -> None:
+    checkpoint_position = payload.get("state_position")
+    if checkpoint_position is None:
+        logger.warning(
+            "Checkpoint has no state_position metadata; using configured value %r.",
+            current_position,
+        )
+        return
+    checkpoint_position = normalize_state_position(checkpoint_position)
+    if checkpoint_position != current_position:
+        raise ValueError(
+            f"Checkpoint state_position {checkpoint_position!r} does not match model "
+            f"state_position {current_position!r}."
+        )
 
 
 class ActionEncoder(nn.Module):
@@ -44,7 +71,7 @@ class ActionEncoder(nn.Module):
 
 
 class StateEncoder(nn.Module):
-    """Two-layer state value encoder; timestep and position are applied outside."""
+    """Two-layer state value encoder."""
 
     def __init__(self, state_dim: int, hidden_dim: int, projector_hidden_dim: int):
         super().__init__()
@@ -90,7 +117,6 @@ class ActionDiT(nn.Module):
         "text_dim",
         "freq_dim",
         "eps",
-        "preprojected_context",
     )
 
     def __init__(
@@ -107,7 +133,6 @@ class ActionDiT(nn.Module):
         projector_hidden_dim: int = 64,
         use_gradient_checkpointing: bool = False,
         attention_backend: str = "sdpa",
-        preprojected_context: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -119,7 +144,6 @@ class ActionDiT(nn.Module):
         self.attn_head_dim = attn_head_dim
         self.projector_hidden_dim = int(projector_hidden_dim)
         self.attention_backend = require_attention_backend(attention_backend)
-        self.preprojected_context = bool(preprojected_context)
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -133,19 +157,11 @@ class ActionDiT(nn.Module):
             hidden_dim=hidden_dim,
             projector_hidden_dim=self.projector_hidden_dim,
         )
-        if self.preprojected_context:
-            if text_dim != hidden_dim:
-                raise ValueError(
-                    "preprojected_context requires text_dim == hidden_dim, "
-                    f"got {text_dim} and {hidden_dim}."
-                )
-            self.text_embedding = nn.Identity()
-        else:
-            self.text_embedding = nn.Sequential(
-                nn.Linear(text_dim, hidden_dim),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, hidden_dim),
             nn.SiLU(),
@@ -235,23 +251,14 @@ class ActionDiT(nn.Module):
             "text_dim": int(action_cfg["text_dim"]),
             "freq_dim": int(action_cfg["freq_dim"]),
             "eps": float(action_cfg["eps"]),
-            "preprojected_context": bool(action_cfg.get("preprojected_context", False)),
         }
         for key in cls.ACTION_BACKBONE_META_KEYS:
             if key not in meta:
-                if key == "preprojected_context" and not expected_meta[key]:
-                    continue
                 raise ValueError(f"`meta.{key}` missing in {action_dit_pretrained_path}")
             expected_value = expected_meta[key]
             got_value = meta[key]
             if key == "eps":
                 if abs(float(got_value) - float(expected_value)) > 1e-12:
-                    raise ValueError(
-                        f"`meta.{key}` mismatch in {action_dit_pretrained_path}: "
-                        f"expected {expected_value}, got {got_value}"
-                    )
-            elif key == "preprojected_context":
-                if bool(got_value) != bool(expected_value):
                     raise ValueError(
                         f"`meta.{key}` mismatch in {action_dit_pretrained_path}: "
                         f"expected {expected_value}, got {got_value}"
@@ -375,7 +382,7 @@ class ActionDiT(nn.Module):
         context_attn_mask = (
             None
             if context_mask is None
-            else context_mask.unsqueeze(1).expand(-1, seq_len, -1)
+            else KeyPaddingMask.from_tensor(context_mask)
         )
         freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
 
@@ -394,7 +401,52 @@ class ActionDiT(nn.Module):
         }
 
     def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
-        return self.action_decoder(tokens)
+        action_len = int(pre_state.get("meta", {}).get("action_len", tokens.shape[1]))
+        return self.action_decoder(tokens[:, :action_len])
+
+    def append_state_tokens(
+        self,
+        pre_state: Dict[str, Any],
+        state_tokens: torch.Tensor,
+    ) -> Dict[str, Any]:
+        action_tokens = pre_state["tokens"]
+        if state_tokens.ndim != 3 or state_tokens.shape[0] != action_tokens.shape[0]:
+            raise ValueError(
+                "State tokens must be [B,S,D] with the same batch size as action tokens."
+            )
+        if state_tokens.shape[2] != self.hidden_dim:
+            raise ValueError(
+                f"State token width must be {self.hidden_dim}, got {state_tokens.shape[2]}."
+            )
+        state_len = int(state_tokens.shape[1])
+        action_len = int(action_tokens.shape[1])
+        total_len = state_len + action_len
+        if total_len > self.freqs.shape[0]:
+            raise ValueError(
+                f"State/action token length {total_len} exceeds RoPE cache {self.freqs.shape[0]}."
+            )
+
+        zero_timestep = pre_state["t"].new_zeros(action_tokens.shape[0])
+        state_t = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, zero_timestep)
+        )
+        state_t_mod = self.time_projection(state_t).unflatten(1, (6, self.hidden_dim))
+        action_t_mod = pre_state["t_mod"]
+        pre_state["tokens"] = torch.cat([action_tokens, state_tokens], dim=1)
+        pre_state["freqs"] = self.freqs[:total_len].view(total_len, 1, -1).to(
+            action_tokens.device
+        )
+        pre_state["t_mod"] = torch.cat(
+            [
+                action_t_mod[:, None].expand(-1, action_len, -1, -1),
+                state_t_mod[:, None].expand(-1, state_len, -1, -1),
+            ],
+            dim=1,
+        )
+        pre_state["meta"].update(
+            {"state_len": state_len, "action_len": action_len, "seq_len": total_len}
+        )
+        return pre_state
 
     def forward(
         self,

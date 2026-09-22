@@ -13,8 +13,10 @@ from torch.utils.checkpoint import checkpoint
 from ..protocol import BLOCK_PROTOCOL_MAIN
 from ...component.attention import (
     AttentionSegment,
+    KeyPaddingMask,
     StructuredAttentionMask,
     build_structured_attention_mask,
+    elide_fully_valid_attention_mask,
     normalize_attention_backend,
     run_attention,
 )
@@ -547,9 +549,9 @@ class Cosmos25VideoDiT(nn.Module):
         context = (
             context if context_is_projected else self.project_context(context)
         ).to(dtype=tokens.dtype)
-        # Native Cosmos cross-attention is mask-free, which also preserves FA4.
-        del context_mask
-        context_mask = None
+        context_mask = elide_fully_valid_attention_mask(context_mask)
+        if isinstance(context_mask, torch.Tensor):
+            context_mask = KeyPaddingMask.from_tensor(context_mask)
         features = self._timestep_features(timestep, self.config.hidden_size).to(tokens.dtype)
         frame_t, frame_adaln = self.t_embedder[1](features)
         frame_t = self.t_embedding_norm(frame_t)
@@ -616,6 +618,7 @@ class Cosmos25VideoDiT(nn.Module):
         timestep_action: torch.Tensor,
         state_tokens: torch.Tensor,
         timestep_state: torch.Tensor,
+        state_position: str,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor],
         context_is_projected: bool = False,
@@ -633,7 +636,9 @@ class Cosmos25VideoDiT(nn.Module):
             freqs_override=freqs_override,
         )
         video_len = video["tokens"].shape[1]
-        parts = [video["tokens"], action_tokens, state_tokens]
+        parts = [video["tokens"], action_tokens]
+        if state_position == "sequence":
+            parts.append(state_tokens)
         tokens = torch.cat(parts, dim=1)
         embeddings = [video["t_mod"]["embedding"]]
         adaln_parts = [video["t_mod"]["adaln_lora"]]
@@ -645,7 +650,10 @@ class Cosmos25VideoDiT(nn.Module):
         ]
         rope_cos, rope_sin = video["freqs"]
         cos_parts, sin_parts = [rope_cos], [rope_sin]
-        for aux, timestep in ((action_tokens, timestep_action), (state_tokens, timestep_state)):
+        auxiliary_inputs = [(action_tokens, timestep_action)]
+        if state_position == "sequence":
+            auxiliary_inputs.append((state_tokens, timestep_state))
+        for aux, timestep in auxiliary_inputs:
             features = self._timestep_features(timestep[:, None], self.config.hidden_size).to(tokens.dtype)
             emb, adaln = self.t_embedder[1](features)
             emb = self.t_embedding_norm(emb)
@@ -663,22 +671,33 @@ class Cosmos25VideoDiT(nn.Module):
             cos_parts.append(cos)
             sin_parts.append(sin)
         projected_context = video["context"]
-        if video["context_mask"] is None:
-            non_state_len = tokens.shape[1] - state_tokens.shape[1]
-            segments = [AttentionSegment(0, non_state_len, ((0, context.shape[1]),))]
-            if state_tokens.shape[1]:
-                segments.append(AttentionSegment(non_state_len, tokens.shape[1], ()))
-            joint_context_mask = (
-                None
-                if not state_tokens.shape[1]
-                else build_structured_attention_mask(
-                    tokens.shape[1], context.shape[1], segments, tokens.device
+        combined_context = projected_context
+        if state_position == "context":
+            combined_context = torch.cat([projected_context, state_tokens], dim=1)
+            if video["context_mask"] is not None:
+                if not isinstance(video["context_mask"], KeyPaddingMask):
+                    raise TypeError("Expected a key-padding mask before appending state context.")
+                state_mask = torch.ones(
+                    state_tokens.shape[:2], dtype=torch.bool, device=state_tokens.device
                 )
-            )
-        else:
-            joint_context_mask = context_mask.to(torch.bool)[:, None].expand(-1, tokens.shape[1], -1).clone()
-            if state_tokens.shape[1]:
-                joint_context_mask[:, -state_tokens.shape[1]:] = False
+                video["context_mask"] = KeyPaddingMask.from_tensor(
+                    torch.cat([video["context_mask"].valid, state_mask], dim=1)
+                )
+            if video["cross_kv_cache"] is not None:
+                if len(video["cross_kv_cache"]) != len(self.blocks):
+                    raise ValueError("Cross-attention KV cache does not cover every transformer layer.")
+                state_kv_cache = tuple(
+                    block.cross_attn.project_kv(state_tokens) for block in self.blocks
+                )
+                video["cross_kv_cache"] = tuple(
+                    (
+                        torch.cat([text_k, state_k], dim=1),
+                        torch.cat([text_v, state_v], dim=1),
+                    )
+                    for (text_k, text_v), (state_k, state_v) in zip(
+                        video["cross_kv_cache"], state_kv_cache
+                    )
+                )
         video["tokens"] = tokens
         video["t_mod"] = {
             "embedding": torch.cat(embeddings, dim=1),
@@ -686,13 +705,14 @@ class Cosmos25VideoDiT(nn.Module):
             "token_to_timestep": torch.cat(modulation_indices),
         }
         video["freqs"] = (torch.cat(cos_parts), torch.cat(sin_parts))
-        video["context"] = projected_context
-        video["context_mask"] = joint_context_mask
+        video["context"] = combined_context
         video["meta"].update(
             {
                 "video_len": video_len,
                 "action_len": action_tokens.shape[1],
-                "state_len": state_tokens.shape[1],
+                "state_len": (
+                    state_tokens.shape[1] if state_position == "sequence" else 0
+                ),
                 "action_modulation_index": video_steps,
             }
         )

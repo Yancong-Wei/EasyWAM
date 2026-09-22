@@ -19,10 +19,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from experiments.robotwin.result_utils import parse_success_rate, task_is_complete  # noqa: E402
+from experiments.robotwin.result_utils import (  # noqa: E402
+    parse_success_rate,
+    task_is_complete,
+)
+from experiments.robotwin.upstream import validate_robotwin_root  # noqa: E402
+from experiments.task_dispatch import build_worker_slots, resolve_gpu_ids  # noqa: E402
 
 WORKER_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "eval_robotwin_worker.py"
-EVAL_STEP_LIMIT_FILE = PROJECT_ROOT / "third_party" / "RoboTwin" / "task_config" / "_eval_step_limit.yml"
 
 
 def _resolve_path(value: str, base: Path = PROJECT_ROOT) -> Path:
@@ -39,17 +43,12 @@ def _resolve_ckpt_tag(checkpoint: Path) -> str:
     return checkpoint.stem
 
 
-def _load_all_tasks() -> list[str]:
-    payload = yaml.safe_load(EVAL_STEP_LIMIT_FILE.read_text(encoding="utf-8"))
+def _load_all_tasks(robotwin_root: Path) -> list[str]:
+    task_file = robotwin_root / "env_cfg" / "task_config" / "_eval_step_limit.yml"
+    payload = yaml.safe_load(task_file.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not payload:
-        raise ValueError(f"Invalid task map: {EVAL_STEP_LIMIT_FILE}")
+        raise ValueError(f"Invalid task map: {task_file}")
     return list(dict.fromkeys(str(key) for key in payload))
-
-
-def _build_worker_slots(num_gpus: int, max_tasks_per_gpu: int) -> list[tuple[int, int]]:
-    if num_gpus <= 0 or max_tasks_per_gpu <= 0:
-        raise ValueError("num_gpus and max_tasks_per_gpu must both be positive.")
-    return [(gpu, slot) for gpu in range(num_gpus) for slot in range(max_tasks_per_gpu)]
 
 
 def _is_blocked_override(raw: str) -> bool:
@@ -102,30 +101,70 @@ def _write_summary(output_dir: Path, tasks: list[str]) -> None:
     (output_dir / "summary.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
+@hydra.main(
+    version_base="1.3",
+    config_path="../../configs",
+    config_name="benchmark/sim_robotwin.yaml",
+)
 def main(cfg: DictConfig) -> None:
     if cfg.ckpt is None:
         raise ValueError("ckpt must not be None.")
     checkpoint = _resolve_path(str(cfg.ckpt))
     if not checkpoint.exists():
         raise FileNotFoundError(checkpoint)
+    robotwin_root = validate_robotwin_root(
+        _resolve_path(str(cfg.EVALUATION.robotwin_root))
+    )
     configured_task = cfg.EVALUATION.task_name
-    tasks = _load_all_tasks() if configured_task is None or not str(configured_task).strip() else [str(configured_task)]
-    slots = _build_worker_slots(int(cfg.MULTIRUN.num_gpus), int(cfg.MULTIRUN.max_tasks_per_gpu))
-
+    tasks = (
+        _load_all_tasks(robotwin_root)
+        if configured_task is None or not str(configured_task).strip()
+        else [str(configured_task)]
+    )
     raw_output = _resolve_path(str(cfg.EVALUATION.output_dir))
-    output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / _resolve_ckpt_tag(checkpoint) / raw_output.name
+    output_dir = (
+        PROJECT_ROOT
+        / "evaluate_results"
+        / "robotwin"
+        / _resolve_ckpt_tag(checkpoint)
+        / raw_output.name
+    )
     pending_tasks = [task for task in tasks if not task_is_complete(output_dir, task)]
-    print(f"Completed tasks: {len(tasks) - len(pending_tasks)}; pending tasks: {len(pending_tasks)}")
+    print(
+        f"Completed tasks: {len(tasks) - len(pending_tasks)}; "
+        f"pending tasks: {len(pending_tasks)}"
+    )
     if not pending_tasks:
         _write_summary(output_dir, tasks)
         print(f"RoboTwin evaluation already complete: {output_dir}")
         return
 
-    worker_count = min(len(pending_tasks), len(slots))
-    shards = [[] for _ in range(worker_count)]
-    for index, task in enumerate(pending_tasks):
-        shards[index % worker_count].append(task)
+    num_gpus = int(cfg.MULTIRUN.num_gpus)
+    gpu_ids = resolve_gpu_ids(
+        num_gpus=num_gpus,
+        gpu_ids=cfg.MULTIRUN.get("gpu_ids"),
+    )
+    workers_per_gpu = int(cfg.MULTIRUN.workers_per_gpu)
+    env_num_per_worker = int(cfg.MULTIRUN.env_num_per_worker)
+    batch_size = int(cfg.MULTIRUN.inference_batch_size)
+    if env_num_per_worker <= 0:
+        raise ValueError("env_num_per_worker must be positive.")
+    if batch_size <= 0 or batch_size > env_num_per_worker:
+        raise ValueError(
+            "inference_batch_size must be positive and cannot exceed "
+            "env_num_per_worker."
+        )
+    slots = build_worker_slots(
+        num_gpus=num_gpus,
+        gpu_ids=gpu_ids,
+        workers_per_gpu=workers_per_gpu,
+        pending_jobs=len(pending_tasks),
+    )
+    print(
+        f"Model workers: {len(slots)} "
+        f"(gpu_ids={gpu_ids}, workers_per_gpu={workers_per_gpu}, "
+        f"env_num_per_worker={env_num_per_worker})"
+    )
 
     worker_dir = output_dir / "workers"
     log_dir = output_dir / "logs"
@@ -133,35 +172,82 @@ def main(cfg: DictConfig) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, output_dir / "manager_config.yaml")
     task_choice = HydraConfig.get().runtime.choices.get("task")
-    extra = [value for value in HydraConfig.get().overrides.task if not _is_blocked_override(value)]
+    extra = [
+        value
+        for value in HydraConfig.get().overrides.task
+        if not _is_blocked_override(value)
+    ]
     processes: list[subprocess.Popen] = []
     handles = []
     try:
-        for worker_index, ((gpu_id, slot), shard) in enumerate(zip(slots, shards)):
-            shard_path = worker_dir / f"worker_{worker_index:03d}.json"
-            shard_path.write_text(json.dumps(shard), encoding="utf-8")
-            log_path = log_dir / f"worker_{worker_index:03d}_gpu_{gpu_id}_slot_{slot}.log"
+        jobs = [{"task_name": task} for task in pending_tasks]
+        task_path = worker_dir / "pending_jobs.jsonl"
+        task_path.write_text(
+            "".join(json.dumps(job) + "\n" for job in jobs), encoding="utf-8"
+        )
+        cursor_path = worker_dir / "task_cursor.txt"
+        cursor_path.write_text("0", encoding="utf-8")
+        for slot in slots:
+            worker_index = slot.worker_index
+            gpu_id = slot.gpu_id
+            log_path = log_dir / f"worker_{worker_index:03d}_gpu_{gpu_id}.log"
             handle = log_path.open("a", encoding="utf-8")
             handles.append(handle)
             command = [
-                sys.executable, str(WORKER_ENTRY), f"task={task_choice}", f"ckpt={checkpoint}",
-                f"gpu_id={gpu_id}", f"WORKER.task_file={shard_path}",
+                sys.executable,
+                str(WORKER_ENTRY),
+                f"task={task_choice}",
+                f"ckpt={checkpoint}",
+                f"gpu_id={gpu_id}",
+                f"WORKER.task_file={task_path}",
+                f"WORKER.task_cursor={cursor_path}",
                 f"EVALUATION.output_dir={output_dir}",
-                f"WORKER.worker_index={worker_index}", *extra,
+                f"WORKER.worker_index={worker_index}",
+                f"MULTIRUN.workers_per_gpu={workers_per_gpu}",
+                f"MULTIRUN.env_num_per_worker={env_num_per_worker}",
+                f"MULTIRUN.inference_batch_size={batch_size}",
+                f"MULTIRUN.inference_batch_wait_ms={float(cfg.MULTIRUN.inference_batch_wait_ms)}",
+                f"MULTIRUN.prompt_cache_size={int(cfg.MULTIRUN.prompt_cache_size)}",
+                *extra,
             ]
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             env.setdefault("PYTHONFAULTHANDLER", "1")
             env.setdefault("PYTHONUNBUFFERED", "1")
             env.setdefault("TORCH_SHOW_CPP_STACKTRACES", "1")
-            processes.append(subprocess.Popen(command, cwd=PROJECT_ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT))
-            print(f"Started worker {worker_index}: gpu={gpu_id} slot={slot}, tasks={len(shard)}")
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                )
+            )
+            print(
+                f"Started model worker {worker_index}: "
+                f"gpu={gpu_id}, gpu_worker={slot.gpu_worker_index}, "
+                f"envs={env_num_per_worker}"
+            )
         while not all(process.poll() == 0 for process in processes):
-            failed = next((p for p in processes if p.poll() not in (None, 0)), None)
-            if failed is not None:
-                code = failed.returncode
+            failed_index = next(
+                (
+                    index
+                    for index, process in enumerate(processes)
+                    if process.poll() not in (None, 0)
+                ),
+                None,
+            )
+            if failed_index is not None:
+                code = processes[failed_index].returncode
+                slot = slots[failed_index]
                 _terminate(processes)
-                raise RuntimeError(f"RoboTwin worker failed with return code {code}; inspect {log_dir}.")
+                raise RuntimeError(
+                    f"RoboTwin worker {slot.worker_index} on GPU {slot.gpu_id} "
+                    f"(gpu_worker={slot.gpu_worker_index}) failed with return "
+                    f"code {code}; "
+                    f"inspect {log_dir}."
+                )
             time.sleep(2)
     finally:
         _terminate(processes)

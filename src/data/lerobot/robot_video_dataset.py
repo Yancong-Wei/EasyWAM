@@ -1,12 +1,10 @@
 import os
 from pathlib import Path
 from typing import Optional
-import time
 import numpy as np
 import traceback
 import torch
 import torchvision.transforms.functional as transforms_F
-from contextlib import contextmanager
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -46,8 +44,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
-        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
-        override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        concat_multi_camera: str = "horizontal",
+        override_instruction: Optional[str] = None,
     ):
         if num_frames <= 1:
             raise ValueError(f"`num_frames` must be greater than 1, got {num_frames}.")
@@ -149,13 +147,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             action_is_pad = sample["action_is_pad"]
             image_is_pad = sample["image_is_pad"]
             proprio_is_pad = sample["proprio_is_pad"]
-            has_pad = False
-            if bool(action_is_pad.any().item()):
-                has_pad = True
-            if bool(image_is_pad.any().item()):
-                has_pad = True
-            if bool(proprio_is_pad.any().item()):
-                has_pad = True
+            has_pad = any(bool(pad.any().item()) for pad in (action_is_pad, image_is_pad, proprio_is_pad))
 
             if not has_pad or attempt >= self.max_padding_retry:
                 break
@@ -164,7 +156,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         
         image_is_pad = sample["image_is_pad"]
 
-        video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+        video = sample["pixel_values"]
         num_cameras = 1
         if video.ndim == 5:
             num_cameras, T_video, C, H, W = video.shape
@@ -183,7 +175,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"expected {expected_video_frames}, got {image_is_pad.shape[0]}."
             )
 
-        video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+        video = video.view(num_cameras, T_video, C, H, W)
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
@@ -194,46 +186,43 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 size=[256, 320],
                 interpolation=transforms_F.InterpolationMode.BILINEAR,
                 antialias=True,
-            )  # [T_video, C, 256, 320]
+            )
             cam_left = transforms_F.resize(
                 video[1],
                 size=[128, 160],
                 interpolation=transforms_F.InterpolationMode.BILINEAR,
                 antialias=True,
-            )  # [T_video, C, 128, 160]
+            )
             cam_right = transforms_F.resize(
                 video[2],
                 size=[128, 160],
                 interpolation=transforms_F.InterpolationMode.BILINEAR,
                 antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            )
+            bottom = torch.cat([cam_left, cam_right], dim=-1)
+            video = torch.cat([cam_top, bottom], dim=-2)
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)
             elif self.concat_multi_camera == "vertical":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)
             else:
                 raise ValueError(
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
                     "Expected one of: horizontal, vertical, robotwin."
                 )
         else:
-            video = video.squeeze(0)  # [T_video, C, H, W]
+            video = video.squeeze(0)
 
-        # final resize and normalization
         video = self.resize_transform(video)
         video = self.crop_transform(video)
-        video = self.normalize_transform(video)  # [T_video, C, H, W]
+        video = self.normalize_transform(video)
 
-        video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
+        video = video.permute(1, 0, 2, 3)
 
-        # Proxy (from lerobot): 
-        #   action: [num_frames-1, action_dim] # start from t0, except the last frame
-        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        # Drop the final proprio step to align it with the action horizon.
+        action = sample["action"]
+        proprio = sample["proprio"][:-1, :]
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
         if action.shape[0] % (video.shape[1] - 1) != 0:
@@ -243,7 +232,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         task = sample["instruction"]
         
-        # FIXME
         if self.override_instruction is not None:
             task = self.override_instruction
         instruction = DEFAULT_PROMPT.format(task=task)
@@ -278,7 +266,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if not cache_path.is_file():
                 raise FileNotFoundError(
                     f"Missing FLUX.2 Qwen3 text cache: {cache_path}. "
-                    "Run ImageWAM scripts/flux2/precompute_flux2_qwen3_embeds.py."
+                    "Run scripts/precompute_text_embeds.py for the selected task."
                 )
             payload = torch.load(cache_path, map_location="cpu", weights_only=True)
             context = payload["text_hidden_states"]
@@ -308,7 +296,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         context = payload["context"]
         context_mask = payload["mask"].bool()
         context[~context_mask] = 0
-        context_mask = torch.ones_like(context_mask)
         return context, context_mask
 
     def __getitem__(self, idx):

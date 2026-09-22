@@ -9,6 +9,7 @@ from ..protocol import BLOCK_PROTOCOL_MAIN
 from ...helpers.gradient import gradient_checkpoint_forward
 from ...component.attention import (
     AttentionSegment,
+    KeyPaddingMask,
     StructuredAttentionMask,
     build_structured_attention_mask,
     elide_fully_valid_attention_mask,
@@ -64,81 +65,28 @@ def rope_apply(x, freqs, num_heads):
 def create_group_causal_attn_mask(
     num_temporal_groups: int, num_query_per_group: int, num_key_per_group: int, mode: str = "causal"
 ) -> torch.Tensor:
-    """
-    Creates a group-based attention mask for scaled dot-product attention with two modes:
-    'causal' and 'group_diagonal'.
+    """Build a group-level boolean attention mask.
 
-    Parameters:
-    - num_temporal_groups (int): The number of temporal groups (e.g., frames in a video sequence).
-    - num_query_per_group (int): The number of query tokens per temporal group. (e.g., latent tokens in a frame, H x W).
-    - num_key_per_group (int): The number of key tokens per temporal group. (e.g., action tokens per frame).
-    - mode (str): The mode of the attention mask. Options are:
-        - 'causal': Query tokens can attend to key tokens from the same or previous temporal groups.
-        - 'group_diagonal': Query tokens can attend only to key tokens from the same temporal group.
-
-    Returns:
-    - attn_mask (torch.Tensor): A boolean tensor of shape (L, S), where:
-        - L = num_temporal_groups * num_query_per_group (total number of query tokens)
-        - S = num_temporal_groups * num_key_per_group (total number of key tokens)
-      The mask indicates where attention is allowed (True) and disallowed (False).
-
-    Example:
-    Input:
-        num_temporal_groups = 3
-        num_query_per_group = 4
-        num_key_per_group = 2
-    Output:
-        Causal Mask Shape: torch.Size([12, 6])
-        Group Diagonal Mask Shape: torch.Size([12, 6])
-        if mode='causal':
-        tensor([[ True,  True, False, False, False, False],
-                [ True,  True, False, False, False, False],
-                [ True,  True, False, False, False, False],
-                [ True,  True, False, False, False, False],
-                [ True,  True,  True,  True, False, False],
-                [ True,  True,  True,  True, False, False],
-                [ True,  True,  True,  True, False, False],
-                [ True,  True,  True,  True, False, False],
-                [ True,  True,  True,  True,  True,  True],
-                [ True,  True,  True,  True,  True,  True],
-                [ True,  True,  True,  True,  True,  True],
-                [ True,  True,  True,  True,  True,  True]])
-
-        if mode='group_diagonal':
-        tensor([[ True,  True, False, False, False, False],
-                [ True,  True, False, False, False, False],
-                [ True,  True, False, False, False, False],
-                [ True,  True, False, False, False, False],
-                [False, False,  True,  True, False, False],
-                [False, False,  True,  True, False, False],
-                [False, False,  True,  True, False, False],
-                [False, False,  True,  True, False, False],
-                [False, False, False, False,  True,  True],
-                [False, False, False, False,  True,  True],
-                [False, False, False, False,  True,  True],
-                [False, False, False, False,  True,  True]])
-
+    ``causal`` exposes the current and previous key groups;
+    ``group_diagonal`` exposes only the matching group. The returned shape is
+    ``(num_temporal_groups * num_query_per_group,
+    num_temporal_groups * num_key_per_group)``.
     """
     assert mode in ["causal", "group_diagonal"], f"Mode {mode} must be 'causal' or 'group_diagonal'"
 
-    # Total number of query and key tokens
-    total_num_query_tokens = num_temporal_groups * num_query_per_group  # Total number of query tokens (L)
-    total_num_key_tokens = num_temporal_groups * num_key_per_group  # Total number of key tokens (S)
+    total_num_query_tokens = num_temporal_groups * num_query_per_group
+    total_num_key_tokens = num_temporal_groups * num_key_per_group
 
-    # Generate time indices for query and key tokens (shape: [L] and [S])
-    query_time_indices = torch.arange(num_temporal_groups).repeat_interleave(num_query_per_group)  # Shape: [L]
-    key_time_indices = torch.arange(num_temporal_groups).repeat_interleave(num_key_per_group)  # Shape: [S]
+    query_time_indices = torch.arange(num_temporal_groups).repeat_interleave(num_query_per_group)
+    key_time_indices = torch.arange(num_temporal_groups).repeat_interleave(num_key_per_group)
 
-    # Expand dimensions to compute outer comparison
-    query_time_indices = query_time_indices.unsqueeze(1)  # Shape: [L, 1]
-    key_time_indices = key_time_indices.unsqueeze(0)  # Shape: [1, S]
+    query_time_indices = query_time_indices.unsqueeze(1)
+    key_time_indices = key_time_indices.unsqueeze(0)
 
     if mode == "causal":
-        # Causal Mode: Query can attend to keys where key_time <= query_time
-        attn_mask = query_time_indices >= key_time_indices  # Shape: [L, S]
-    elif mode == "group_diagonal":
-        # Group Diagonal Mode: Query can attend only to keys where key_time == query_time
-        attn_mask = query_time_indices == key_time_indices  # Shape: [L, S]
+        attn_mask = query_time_indices >= key_time_indices
+    else:
+        attn_mask = query_time_indices == key_time_indices
 
     assert attn_mask.shape == (total_num_query_tokens, total_num_key_tokens), "Attention mask shape mismatch"
     return attn_mask
@@ -184,8 +132,6 @@ class SelfAttention(nn.Module):
         self.norm_k = nn.RMSNorm(self.attn_hidden_dim, eps=eps)
         self.attention_backend = require_attention_backend(attention_backend)
         
-        # self.attn = AttentionModule(self.num_heads)
-
     def forward(
         self,
         x,
@@ -231,8 +177,6 @@ class CrossAttention(nn.Module):
         self.norm_k = nn.RMSNorm(self.attn_hidden_dim, eps=eps)
         self.attention_backend = require_attention_backend(attention_backend)
             
-        # self.attn = AttentionModule(self.num_heads)
-
     def project_kv(self, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project static cross-attention context once for inference reuse."""
         return self.norm_k(self.k(ctx)), self.v(ctx)
@@ -461,7 +405,7 @@ class WanVideoDiT(torch.nn.Module):
         ])
         self.head = Head(hidden_dim, out_dim, patch_size, eps)
         self.freqs = precompute_freqs_cis_3d(attn_head_dim)
-        # Unified action/state tokens retain their historical full-head 1D RoPE.
+        # Unified action tokens use full-head 1D RoPE.
         # This tensor is derived metadata rather than checkpoint state.
         self.freqs_aux = precompute_freqs_cis(attn_head_dim, end=4096)
         if has_ref_conv:
@@ -628,6 +572,8 @@ class WanVideoDiT(torch.nn.Module):
             context_mask=context_mask,
         )
         context_mask = elide_fully_valid_attention_mask(context_mask)
+        if isinstance(context_mask, torch.Tensor):
+            context_mask = KeyPaddingMask.from_tensor(context_mask)
 
         batch_size = x.shape[0]
         patch_h = int(self.patch_size[1])
@@ -661,9 +607,6 @@ class WanVideoDiT(torch.nn.Module):
         f, h, w = x.shape[2:]
 
         context = context if context_is_projected else self.project_context(context)
-        if context_mask is not None:
-            context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
-
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
         freqs = freqs_override
@@ -703,6 +646,7 @@ class WanVideoDiT(torch.nn.Module):
         timestep_action: torch.Tensor,
         state_tokens: torch.Tensor,
         timestep_state: torch.Tensor,
+        state_position: str,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor],
         context_is_projected: bool = False,
@@ -723,7 +667,11 @@ class WanVideoDiT(torch.nn.Module):
         video_len = video["tokens"].shape[1]
         action_len = action_tokens.shape[1]
         state_len = state_tokens.shape[1]
-        if action_len > self.freqs_aux.shape[0] or state_len > self.freqs_aux.shape[0]:
+        max_aux_len = max(
+            action_len,
+            state_len if state_position == "sequence" else 0,
+        )
+        if max_aux_len > self.freqs_aux.shape[0]:
             raise ValueError(
                 "Unified auxiliary token length exceeds Wan RoPE cache: "
                 f"action={action_len}, state={state_len}, cache={self.freqs_aux.shape[0]}."
@@ -742,44 +690,60 @@ class WanVideoDiT(torch.nn.Module):
             )
 
         action_t, action_t_mod = _aux_time(timestep_action, action_len)
-        state_t, state_t_mod = _aux_time(timestep_state, state_len)
-        tokens = torch.cat([video["tokens"], action_tokens, state_tokens], dim=1)
-        video["tokens"] = tokens
-        video["t"] = torch.cat([video["t"], action_t, state_t], dim=1)
-        video["t_mod"] = torch.cat(
-            [video["t_mod"], action_t_mod, state_t_mod], dim=1
-        )
-        video["freqs"] = torch.cat(
-            [
-                video["freqs"],
-                self.freqs_aux[:action_len].view(action_len, 1, -1).to(tokens.device),
-                self.freqs_aux[:state_len].view(state_len, 1, -1).to(tokens.device),
-            ],
-            dim=0,
-        )
-
-        original_context_mask = video["context_mask"]
-        if original_context_mask is None:
-            non_state_len = tokens.shape[1] - state_len
-            segments = [AttentionSegment(0, non_state_len, ((0, context.shape[1]),))]
-            if state_len:
-                segments.append(AttentionSegment(non_state_len, tokens.shape[1], ()))
-            video["context_mask"] = (
-                None
-                if not state_len
-                else build_structured_attention_mask(
-                    tokens.shape[1], context.shape[1], segments, tokens.device
-                )
+        token_parts = [video["tokens"], action_tokens]
+        time_parts = [video["t"], action_t]
+        modulation_parts = [video["t_mod"], action_t_mod]
+        frequency_parts = [
+            video["freqs"],
+            self.freqs_aux[:action_len].view(action_len, 1, -1).to(action_tokens.device),
+        ]
+        if state_position == "sequence":
+            state_t, state_t_mod = _aux_time(timestep_state, state_len)
+            token_parts.append(state_tokens)
+            time_parts.append(state_t)
+            modulation_parts.append(state_t_mod)
+            frequency_parts.append(
+                self.freqs_aux[:state_len].view(state_len, 1, -1).to(state_tokens.device)
             )
-        else:
-            compact = original_context_mask[:, 0, :]
-            joint = compact.unsqueeze(1).expand(-1, tokens.shape[1], -1).clone()
-            if state_len:
-                joint[:, -state_len:, :] = False
-            video["context_mask"] = joint
+        tokens = torch.cat(token_parts, dim=1)
+        video["tokens"] = tokens
+        video["t"] = torch.cat(time_parts, dim=1)
+        video["t_mod"] = torch.cat(modulation_parts, dim=1)
+        video["freqs"] = torch.cat(frequency_parts, dim=0)
+
+        if state_position == "context":
+            video["context"] = torch.cat([video["context"], state_tokens], dim=1)
+            if video["context_mask"] is not None:
+                if not isinstance(video["context_mask"], KeyPaddingMask):
+                    raise TypeError("Expected a key-padding mask before appending state context.")
+                state_mask = torch.ones(
+                    state_tokens.shape[:2], dtype=torch.bool, device=state_tokens.device
+                )
+                video["context_mask"] = KeyPaddingMask.from_tensor(
+                    torch.cat([video["context_mask"].valid, state_mask], dim=1)
+                )
+            if video["cross_kv_cache"] is not None:
+                if len(video["cross_kv_cache"]) != len(self.blocks):
+                    raise ValueError("Cross-attention KV cache does not cover every transformer layer.")
+                state_kv_cache = tuple(
+                    block.cross_attn.project_kv(state_tokens) for block in self.blocks
+                )
+                video["cross_kv_cache"] = tuple(
+                    (
+                        torch.cat([text_k, state_k], dim=1),
+                        torch.cat([text_v, state_v], dim=1),
+                    )
+                    for (text_k, text_v), (state_k, state_v) in zip(
+                        video["cross_kv_cache"], state_kv_cache
+                    )
+                )
 
         video["meta"].update(
-            {"video_len": video_len, "action_len": action_len, "state_len": state_len}
+            {
+                "video_len": video_len,
+                "action_len": action_len,
+                "state_len": state_len if state_position == "sequence" else 0,
+            }
         )
         return video
 

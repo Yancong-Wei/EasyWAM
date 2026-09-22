@@ -4,13 +4,13 @@ task_name: null
 task_config: null
 ckpt_setting: null
 seed: 0
-instruction_type: unseen
+instruction_type: null
 eval_num_episodes: 100
 
 # EasyWAM policy arguments
 sim_cfg_path: null
 sim_task: null
-sim_cfg_name: sim_robotwin.yaml
+sim_cfg_name: benchmark/sim_robotwin.yaml
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null
@@ -22,4 +22,6 @@ text_cfg_scale: 1.0
 negative_prompt: ""
 rand_device: cpu
 timing_enabled: false
-skip_get_obs_within_replan: false
+inference_batch_size: 4
+inference_batch_wait_ms: 10
+prompt_cache_size: 40

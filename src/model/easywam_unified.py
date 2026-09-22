@@ -3,11 +3,16 @@ from typing import Any, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 
 from utils.logging_config import get_logger
 
-from .component.action_dit import ActionDecoder, ActionEncoder, StateEncoder
+from .component.action_dit import (
+    ActionDecoder,
+    ActionEncoder,
+    StateEncoder,
+    normalize_state_position,
+    validate_checkpoint_state_position,
+)
 from .component.attention import (
     AttentionSegment,
     StructuredAttentionMask,
@@ -17,6 +22,12 @@ from .component.attention import (
 from .backbone.wan22.loader import load_wan22_ti2v_5b_components
 from .schedulers.scheduler_continuous import ContinuousFlowMatchScheduler
 from .schedulers.scheduler_flow_unipc import FlowUniPCScheduler
+from .helpers.batching import (
+    decode_video_batch,
+    encode_image_batch,
+    randn_per_sample,
+    validate_single_inference_image,
+)
 
 logger = get_logger(__name__)
 
@@ -32,6 +43,7 @@ class EasyWAMUnified(nn.Module):
         vae,
         action_dim: int,
         state_dim: int,
+        state_position: str = "context",
         text_encoder=None,
         tokenizer=None,
         text_dim: Optional[int] = None,
@@ -49,9 +61,11 @@ class EasyWAMUnified(nn.Module):
         self.backbone_name = getattr(video_dit, "backbone_name", "wan22")
         self.action_dim = int(action_dim)
         self.state_dim = int(state_dim)
+        self.state_position = normalize_state_position(state_position)
         self.projector_hidden_dim = int(projector_hidden_dim)
 
         self.hidden_dim = int(video_dit.hidden_dim)
+        self.context_dim = int(getattr(video_dit, "text_dim", self.hidden_dim))
         self.freq_dim = int(video_dit.freq_dim)
         self.num_heads = int(video_dit.num_heads)
         self.attn_head_dim = int(video_dit.attn_head_dim)
@@ -62,7 +76,11 @@ class EasyWAMUnified(nn.Module):
                 "video_dit": video_dit,
                 "state_encoder": StateEncoder(
                     state_dim=self.state_dim,
-                    hidden_dim=self.hidden_dim,
+                    hidden_dim=(
+                        self.context_dim
+                        if self.state_position == "context"
+                        else self.hidden_dim
+                    ),
                     projector_hidden_dim=self.projector_hidden_dim,
                 ),
                 "action_encoder": ActionEncoder(
@@ -117,8 +135,7 @@ class EasyWAMUnified(nn.Module):
                 "EasyWAM-Unified supports scheduler families for 'wan22' and "
                 f"'cosmos25', got backbone {self.backbone_name!r}."
             )
-        # Compatibility aliases refer to the same scheduler object. Unified uses
-        # one schedule for video/action and copies the video timestep to action.
+        # Video and action share a scheduler and timestep.
         self.train_scheduler = self.scheduler
         self.infer_scheduler = self.scheduler
         self.to(device=self.device, dtype=self.torch_dtype)
@@ -136,37 +153,53 @@ class EasyWAMUnified(nn.Module):
         clean_video_len: int,
         future_video_len: int,
         action_len: int,
-        state_len: int,
         device: torch.device,
+        state_len: int = 0,
         video_attention_mask_mode: str = "first_frame_causal",
     ) -> StructuredAttentionMask:
-        total = clean_video_len + future_video_len + action_len + state_len
-        future_action_end = clean_video_len + future_video_len + action_len
+        video_len = clean_video_len + future_video_len
+        state_start = video_len + action_len
+        total = state_start + state_len
         if video_attention_mask_mode == "bidirectional":
             segments = [
-                AttentionSegment(0, future_action_end, ((0, total),)),
+                AttentionSegment(0, total, ((0, total),)),
             ]
         elif video_attention_mask_mode == "first_frame_causal":
+            clean_key_ranges = [(0, clean_video_len)]
+            if state_len:
+                clean_key_ranges.append((state_start, total))
             segments = [
-                AttentionSegment(0, clean_video_len, ((0, clean_video_len),)),
+                AttentionSegment(0, clean_video_len, tuple(clean_key_ranges)),
             ]
+        elif video_attention_mask_mode == "per_frame_causal":
+            if clean_video_len <= 0 or video_len % clean_video_len:
+                raise ValueError(
+                    "Unified video token length must be divisible by tokens per frame "
+                    "in per_frame_causal mode."
+                )
+            segments = []
+            for frame_start in range(0, video_len, clean_video_len):
+                frame_end = frame_start + clean_video_len
+                key_ranges = [(0, frame_end)]
+                if state_len:
+                    key_ranges.append((state_start, total))
+                segments.append(
+                    AttentionSegment(frame_start, frame_end, tuple(key_ranges))
+                )
         else:
             raise ValueError(
                 "EasyWAM-Unified supports `video_attention_mask_mode` values "
-                "'first_frame_causal' and 'bidirectional', "
+                "'first_frame_causal', 'per_frame_causal', and 'bidirectional', "
                 f"got {video_attention_mask_mode!r}."
             )
-        if (
-            video_attention_mask_mode == "first_frame_causal"
-            and clean_video_len < future_action_end
-        ):
+        if video_attention_mask_mode == "first_frame_causal" and clean_video_len < state_start:
             segments.append(
-                AttentionSegment(clean_video_len, future_action_end, ((0, total),))
+                AttentionSegment(clean_video_len, state_start, ((0, total),))
             )
-        if future_action_end < total:
-            segments.append(
-                AttentionSegment(future_action_end, total, ((future_action_end, total),))
-            )
+        if video_attention_mask_mode == "per_frame_causal" and video_len < state_start:
+            segments.append(AttentionSegment(video_len, state_start, ((0, total),)))
+        if video_attention_mask_mode != "bidirectional" and state_len:
+            segments.append(AttentionSegment(state_start, total, ((0, total),)))
         return build_structured_attention_mask(
             query_len=total,
             key_len=total,
@@ -212,8 +245,6 @@ class EasyWAMUnified(nn.Module):
             timestep_action = timestep_action.expand(batch_size)
         if timestep_video.shape[0] != batch_size or timestep_action.shape[0] != batch_size:
             raise ValueError("Video/action timestep batch size must match input batch size.")
-        timestep_state = timestep_action
-
         if context_mask is not None:
             context_mask = context_mask.to(device=x.device, dtype=torch.bool)
 
@@ -233,7 +264,8 @@ class EasyWAMUnified(nn.Module):
             action_tokens=action_tokens,
             timestep_action=timestep_action.to(device=x.device, dtype=x.dtype),
             state_tokens=state_tokens,
-            timestep_state=timestep_state.to(device=x.device, dtype=x.dtype),
+            timestep_state=torch.zeros_like(timestep_action, device=x.device, dtype=x.dtype),
+            state_position=self.state_position,
             context=context if projected_context is None else projected_context,
             context_mask=context_mask,
             context_is_projected=projected_context is not None,
@@ -246,7 +278,7 @@ class EasyWAMUnified(nn.Module):
             clean_video_len=tokens_per_frame,
             future_video_len=video_len - tokens_per_frame,
             action_len=action_tokens.shape[1],
-            state_len=state_tokens.shape[1],
+            state_len=(state_tokens.shape[1] if self.state_position == "sequence" else 0),
             device=tokens.device,
             video_attention_mask_mode=self.video_dit.video_attention_mask_mode,
         )
@@ -278,6 +310,7 @@ class EasyWAMUnified(nn.Module):
         *,
         action_dim: int,
         state_dim: int,
+        state_position: str = "context",
         projector_hidden_dim: int = 64,
         skip_dit_load_from_pretrain: bool = False,
         device: str = "cuda",
@@ -305,6 +338,7 @@ class EasyWAMUnified(nn.Module):
             vae=components.vae,
             action_dim=action_dim,
             state_dim=state_dim,
+            state_position=state_position,
             text_encoder=components.text_encoder,
             tokenizer=components.tokenizer,
             text_dim=int(cfg["text_dim"]),
@@ -339,6 +373,7 @@ class EasyWAMUnified(nn.Module):
         video_dit_config: dict[str, Any] | None = None,
         action_dim: int | None = None,
         state_dim: int | None = None,
+        state_position: str = "context",
         projector_hidden_dim: int = 64,
         skip_dit_load_from_pretrain: bool = False,
         video_train_shift: float = 5.0,
@@ -370,6 +405,7 @@ class EasyWAMUnified(nn.Module):
             vae=components.vae,
             action_dim=int(action_dim),
             state_dim=int(state_dim),
+            state_position=state_position,
             text_encoder=components.text_encoder,
             tokenizer=components.tokenizer,
             text_dim=int(video_dit_config["text_dim"]),
@@ -422,10 +458,6 @@ class EasyWAMUnified(nn.Module):
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        mask = torch.ones_like(mask)
         return prompt_emb.to(device=self.device), mask
 
     @torch.no_grad()
@@ -434,27 +466,10 @@ class EasyWAMUnified(nn.Module):
 
     @torch.no_grad()
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor):
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
-            raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
-            )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode([image], device=self.device)
-        if isinstance(z, list):
-            z = z[0].unsqueeze(0)
-        return z
+        return encode_image_batch(self.vae, input_image, self.device)
 
     def _decode_latents(self, latents):
-        video_tensor = self.vae.decode(latents, device=self.device)
-        video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
-        video_tensor = ((video_tensor + 1.0) * 127.5).to(torch.uint8).cpu()
-        frames = []
-        for t in range(video_tensor.shape[1]):
-            frame = video_tensor[:, t].permute(1, 2, 0).numpy()
-            frames.append(Image.fromarray(frame))
-        return frames
+        return decode_video_batch(self.vae, latents, self.device)
 
     def build_inputs(self, sample):
         video = sample["video"]
@@ -609,7 +624,7 @@ class EasyWAMUnified(nn.Module):
 
     def _prepare_context(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -633,9 +648,9 @@ class EasyWAMUnified(nn.Module):
         )
 
     @torch.inference_mode()
-    def infer_joint(
+    def infer_joint_batch(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
@@ -647,7 +662,7 @@ class EasyWAMUnified(nn.Module):
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
-        seed: Optional[int] = None,
+        seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
         decode_video: bool = True,
         **kwargs,
@@ -656,16 +671,20 @@ class EasyWAMUnified(nn.Module):
         self.eval()
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
-            raise ValueError(f"`input_image` must be [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}")
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
+            raise ValueError(f"`input_image` must be [B,3,H,W] or [3,H,W], got {tuple(input_image.shape)}")
+        batch_size = int(input_image.shape[0])
         if proprio is None:
             raise ValueError("EasyWAM-Unified inference requires `proprio` as state.")
         if proprio.ndim == 1:
             proprio = proprio.view(1, 1, -1)
         elif proprio.ndim == 2:
-            proprio = proprio.unsqueeze(0)
-        if proprio.ndim != 3:
-            raise ValueError(f"`proprio` must be [D], [T,D], or [1,T,D], got {tuple(proprio.shape)}")
+            if proprio.shape[0] == batch_size:
+                proprio = proprio.unsqueeze(1)
+            elif batch_size == 1:
+                proprio = proprio.unsqueeze(0)
+        if proprio.ndim != 3 or proprio.shape[0] != batch_size:
+            raise ValueError(f"`proprio` must be [B,D] or [B,T,D], got {tuple(proprio.shape)}")
 
         _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
@@ -678,19 +697,13 @@ class EasyWAMUnified(nn.Module):
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
-        video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_video = torch.randn(
-            (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
-            generator=video_generator,
-            device=rand_device,
-            dtype=torch.float32,
+        latents_video = randn_per_sample(
+            (self.vae.model.z_dim, latent_t, latent_h, latent_w), seeds=seed,
+            batch_size=batch_size, rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_dim),
-            generator=action_generator,
-            device=rand_device,
-            dtype=torch.float32,
+        latents_action = randn_per_sample(
+            (action_horizon, self.action_dim), seeds=seed,
+            batch_size=batch_size, rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
 
         first_frame_latents = self._encode_input_image_latents_tensor(
@@ -699,6 +712,8 @@ class EasyWAMUnified(nn.Module):
         latents_video[:, :, 0:1] = first_frame_latents
         state = proprio[:, 0:1].to(device=self.device, dtype=self.torch_dtype)
         context, context_mask = self._prepare_context(prompt, context, context_mask)
+        if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+            raise ValueError("Context batch size must match input_image batch size.")
         projected_context = self.video_dit.project_context(context)
         cross_kv_cache = None
         if bool(getattr(self, "inference_cross_kv_reuse", False)):
@@ -713,7 +728,7 @@ class EasyWAMUnified(nn.Module):
             shift_override=self.infer_shift if sigma_shift is None else sigma_shift,
         )
         for step_t, step_delta in zip(infer_timesteps, infer_deltas):
-            timestep_video = step_t.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
+            timestep_video = step_t.expand(batch_size).to(dtype=latents_video.dtype, device=self.device)
             timestep_action = timestep_video.to(
                 dtype=latents_action.dtype, device=self.device
             )
@@ -742,28 +757,29 @@ class EasyWAMUnified(nn.Module):
             latents_video[:, :, 0:1] = first_frame_latents
 
         result = {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": latents_action.detach().to(device="cpu", dtype=torch.float32),
         }
         if decode_video:
             result["video"] = self._decode_latents(latents_video)
         return result
 
     @torch.inference_mode()
-    def infer_action(
+    def infer_action_batch(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         action_horizon: int,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
+        num_video_frames: int = 5,
         **kwargs,
     ) -> dict[str, Any]:
         kwargs.pop("decode_video", None)
-        out = self.infer_joint(
+        out = self.infer_joint_batch(
             prompt=prompt,
             input_image=input_image,
-            num_video_frames=kwargs.pop("num_video_frames", 5),
+            num_video_frames=num_video_frames,
             action_horizon=action_horizon,
             proprio=proprio,
             context=context,
@@ -772,6 +788,21 @@ class EasyWAMUnified(nn.Module):
             **kwargs,
         )
         return {"action": out["action"]}
+
+    @torch.inference_mode()
+    def infer_joint(self, *args, **kwargs) -> dict[str, Any]:
+        validate_single_inference_image(args, kwargs)
+        result = self.infer_joint_batch(*args, **kwargs)
+        result["action"] = result["action"][0]
+        if "video" in result and result["video"] and isinstance(result["video"][0], list):
+            result["video"] = result["video"][0]
+        return result
+
+    @torch.inference_mode()
+    def infer_action(self, *args, **kwargs) -> dict[str, Any]:
+        validate_single_inference_image(args, kwargs)
+        result = self.infer_action_batch(*args, **kwargs)
+        return {"action": result["action"][0]}
 
     @torch.inference_mode()
     def infer(
@@ -825,8 +856,9 @@ class EasyWAMUnified(nn.Module):
                 "dit": self.dit.state_dict(),
                 "step": step,
                 "torch_dtype": str(self.torch_dtype),
-                "backbone_name": getattr(self, "backbone_name", "wan22"),
+                "backbone_name": self.backbone_name,
             }
+        payload["state_position"] = self.state_position
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -839,11 +871,12 @@ class EasyWAMUnified(nn.Module):
         )
 
         payload = torch.load(path, map_location="cpu")
+        validate_checkpoint_state_position(payload, self.state_position)
         checkpoint_backbone = payload.get("backbone_name")
-        if checkpoint_backbone is not None and checkpoint_backbone != getattr(self, "backbone_name", "wan22"):
+        if checkpoint_backbone is not None and checkpoint_backbone != self.backbone_name:
             raise ValueError(
                 f"Checkpoint backbone {checkpoint_backbone!r} does not match model backbone "
-                f"{getattr(self, 'backbone_name', 'wan22')!r}."
+                f"{self.backbone_name!r}."
             )
         if is_lora_checkpoint(payload):
             load_lora_model_checkpoint_state(

@@ -25,6 +25,8 @@ max_steps: 1000
 max_epochs: null
 log_every: 10
 save_every: 100
+# Retain only the most recent weight checkpoints and matching training states.
+checkpoint_save_limit: 3
 eval_every: 50
 eval_num_inference_steps: 10
 # Save one stitched prediction / VAE reconstruction / GT video per rank at each eval.
@@ -59,3 +61,7 @@ hydra:
   run:
     dir: .
   output_subdir: null
+  job_logging:
+    handlers:
+      file:
+        filename: /dev/null

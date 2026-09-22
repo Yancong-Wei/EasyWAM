@@ -4,6 +4,7 @@ import inspect
 import math
 import os
 import re
+import shutil
 from contextlib import nullcontext
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -100,6 +101,15 @@ class EasyWAMTrainer:
         self.dataloader_worker_threads = int(cfg.get("dataloader_worker_threads", 1))
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        checkpoint_save_limit = cfg.get("checkpoint_save_limit", 5)
+        self.checkpoint_save_limit = (
+            None if checkpoint_save_limit is None else int(checkpoint_save_limit)
+        )
+        if self.checkpoint_save_limit is not None and self.checkpoint_save_limit <= 0:
+            raise ValueError(
+                "`checkpoint_save_limit` must be null or > 0, "
+                f"got {self.checkpoint_save_limit}."
+            )
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.eval_save_video = bool(cfg.get("eval_save_video", False))
@@ -155,8 +165,7 @@ class EasyWAMTrainer:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
         self._resolve_train_schedule()
 
-        # Freeze non-trainable modules before optimizer/deepspeed initialization.
-        # This keeps DiT (+ optional state encoder) as trainable when ZeRO builds optimizer state.
+        # Freeze modules before ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
         total_params = _count_parameters(self.model)
         trainable_params_count = _count_parameters(self.model, trainable_only=True)
@@ -634,24 +643,21 @@ class EasyWAMTrainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
-        # 1. training loss
         with self.accelerator.autocast():
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
         
         prompt = sample["prompt"][0]
-        video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
+        video0 = sample["video"][0]
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
-        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
+        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
 
-        # 2. inference and video saving
         infer_kwargs = {
             "input_image": input_image,
             "num_frames": num_frames,
@@ -677,7 +683,6 @@ class EasyWAMTrainer:
         pred_video = pred["video"]
         pred_action = pred.get("action", None)
 
-        # 3. inference metrics against GT video
         pred_video_tensor = pil_frames_to_video_tensor(pred_video)
         gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
 
@@ -744,10 +749,14 @@ class EasyWAMTrainer:
             action_l1 = action_diff.abs().mean().item()
             action_l2 = action_diff.pow(2).mean().item()
 
-        # 4. VAE reconstruction metrics against GT video
         gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
         vae_latents = model._encode_video_latents(gt_video_batch)
-        vae_recon_video = model._decode_latents(vae_latents)
+        vae_recon_batch = model._decode_latents(vae_latents)
+        if len(vae_recon_batch) != 1:
+            raise ValueError(
+                f"Eval VAE reconstruction must contain one video, got {len(vae_recon_batch)}."
+            )
+        vae_recon_video = vae_recon_batch[0]
         vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
 
         assert vae_video_tensor.shape == gt_video_tensor.shape, (
@@ -868,6 +877,42 @@ class EasyWAMTrainer:
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
+    @staticmethod
+    def _prune_step_artifacts(directory: str, max_to_keep: int, *, suffix: str = ""):
+        pattern = re.compile(rf"^step_(\d+){re.escape(suffix)}$")
+        artifacts = []
+        for path in Path(directory).iterdir():
+            match = pattern.fullmatch(path.name)
+            if match is None:
+                continue
+            if suffix:
+                if not path.is_file():
+                    continue
+            elif not path.is_dir() or path.is_symlink():
+                continue
+            artifacts.append((int(match.group(1)), path))
+
+        artifacts.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+        for _, path in artifacts[max_to_keep:]:
+            if suffix:
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+            logger.info("[ckpt] removed old artifact: %s", path)
+
+    def _prune_saved_checkpoints(self):
+        if self.checkpoint_save_limit is None:
+            return
+        self._prune_step_artifacts(
+            self.weights_dir,
+            self.checkpoint_save_limit,
+            suffix=".pt",
+        )
+        self._prune_step_artifacts(
+            self.state_dir,
+            self.checkpoint_save_limit,
+        )
+
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
@@ -890,6 +935,10 @@ class EasyWAMTrainer:
                 state_path,
                 time.perf_counter() - state_started_at,
             )
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            self._prune_saved_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}

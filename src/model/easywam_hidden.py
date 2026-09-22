@@ -3,13 +3,23 @@ from typing import Any, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 
 from utils.logging_config import get_logger
 
-from .component.action_dit import ActionDiT, StateEncoder
+from .component.action_dit import (
+    ActionDiT,
+    StateEncoder,
+    normalize_state_position,
+    validate_checkpoint_state_position,
+)
 from .component.attention import elide_fully_valid_attention_mask
 from .helpers.gradient import gradient_checkpoint_forward
+from .helpers.batching import (
+    decode_video_batch,
+    encode_image_batch,
+    randn_per_sample,
+    validate_single_inference_image,
+)
 from .backbone.wan22.loader import load_wan22_ti2v_5b_components
 from .schedulers.scheduler_continuous import ContinuousFlowMatchScheduler
 
@@ -28,6 +38,7 @@ class EasyWAMHidden(nn.Module):
         action_dit: ActionDiT,
         vae,
         state_dim: int,
+        state_position: str = "context",
         text_encoder=None,
         tokenizer=None,
         text_dim: Optional[int] = None,
@@ -64,6 +75,7 @@ class EasyWAMHidden(nn.Module):
         )
         self.action_dim = int(action_dit.action_dim)
         self.state_dim = int(state_dim)
+        self.state_position = normalize_state_position(state_position)
         self.video_hidden_layer = int(video_hidden_layer)
         self.detach_video_hidden = bool(detach_video_hidden)
         self.vae = vae
@@ -258,36 +270,57 @@ class EasyWAMHidden(nn.Module):
             if projected_context is None
             else projected_context
         )
+        state_tokens = self.dit["state_encoder"](
+            state.to(device=action.device, dtype=action.dtype)
+        ).to(dtype=video_context.dtype)
+        action_context = video_context
+        action_context_mask = video_token_mask
+        action_cross_kv_cache = cross_kv_cache
+        if self.state_position == "context":
+            action_context = torch.cat([video_context, state_tokens], dim=1)
+            if video_token_mask is not None:
+                state_mask = torch.ones(
+                    state_tokens.shape[:2],
+                    dtype=torch.bool,
+                    device=video_token_mask.device,
+                )
+                action_context_mask = torch.cat([video_token_mask, state_mask], dim=1)
+            if cross_kv_cache is not None:
+                if len(cross_kv_cache) != len(self.action_dit.blocks):
+                    raise ValueError(
+                        "Cross-attention KV cache does not cover every Action DiT layer."
+                    )
+                state_kv_cache = tuple(
+                    block.cross_attn.project_kv(state_tokens)
+                    for block in self.action_dit.blocks
+                )
+                action_cross_kv_cache = tuple(
+                    (
+                        torch.cat([video_k, state_k], dim=1),
+                        torch.cat([video_v, state_v], dim=1),
+                    )
+                    for (video_k, video_v), (state_k, state_v) in zip(
+                        cross_kv_cache, state_kv_cache
+                    )
+                )
         action_pre = self.action_dit.pre_dit(
             action_tokens=action,
             timestep=timestep,
-            context=video_context,
-            context_mask=video_token_mask,
+            context=action_context,
+            context_mask=action_context_mask,
             context_is_projected=True,
-            cross_kv_cache=cross_kv_cache,
+            cross_kv_cache=action_cross_kv_cache,
         )
-        state_tokens = self.dit["state_encoder"](
-            state.to(device=action.device, dtype=action.dtype)
-        )
-        state_len = state_tokens.shape[1]
-        tokens = torch.cat([state_tokens, action_pre["tokens"]], dim=1)
-        if tokens.shape[1] > self.action_dit.freqs.shape[0]:
-            raise ValueError(
-                f"State/action token length {tokens.shape[1]} exceeds ActionDiT RoPE cache "
-                f"{self.action_dit.freqs.shape[0]}."
-            )
-        freqs = self.action_dit.freqs[: tokens.shape[1]].view(
-            tokens.shape[1], 1, -1
-        ).to(tokens.device)
-
-        context_attn_mask = None
-        if video_token_mask is not None:
-            context_attn_mask = video_token_mask.unsqueeze(1).expand(
-                -1, tokens.shape[1], -1
-            )
+        if self.state_position == "sequence":
+            action_pre = self.action_dit.append_state_tokens(action_pre, state_tokens)
+        tokens = action_pre["tokens"]
 
         for layer_index, block in enumerate(self.action_dit.blocks):
-            context_kv = None if cross_kv_cache is None else cross_kv_cache[layer_index]
+            context_kv = (
+                None
+                if action_pre["cross_kv_cache"] is None
+                else action_pre["cross_kv_cache"][layer_index]
+            )
             if self.action_dit.use_gradient_checkpointing:
                 tokens = gradient_checkpoint_forward(
                     block,
@@ -295,8 +328,8 @@ class EasyWAMHidden(nn.Module):
                     tokens,
                     action_pre["context"],
                     action_pre["t_mod"],
-                    freqs,
-                    context_mask=context_attn_mask,
+                    action_pre["freqs"],
+                    context_mask=action_pre["context_mask"],
                     context_kv=context_kv,
                 )
             else:
@@ -304,11 +337,11 @@ class EasyWAMHidden(nn.Module):
                     tokens,
                     action_pre["context"],
                     action_pre["t_mod"],
-                    freqs,
-                    context_mask=context_attn_mask,
+                    action_pre["freqs"],
+                    context_mask=action_pre["context_mask"],
                     context_kv=context_kv,
                 )
-        return self.action_dit.action_decoder(tokens[:, state_len:])
+        return self.action_dit.post_dit(tokens, action_pre)
 
     def _forward_dit(
         self,
@@ -354,6 +387,7 @@ class EasyWAMHidden(nn.Module):
         action_dit_pretrained_path: str | None,
         action_dim: int,
         state_dim: int,
+        state_position: str = "context",
         projector_hidden_dim: int = 64,
         video_hidden_layer: int = 17,
         detach_video_hidden: bool = True,
@@ -392,6 +426,7 @@ class EasyWAMHidden(nn.Module):
             action_dit=action_dit,
             vae=components.vae,
             state_dim=state_dim,
+            state_position=state_position,
             text_encoder=components.text_encoder,
             tokenizer=components.tokenizer,
             text_dim=int(cfg["text_dim"]),
@@ -450,6 +485,7 @@ class EasyWAMHidden(nn.Module):
         action_dit_pretrained_path: str | None = None,
         action_dim: int | None = None,
         state_dim: int | None = None,
+        state_position: str = "context",
         projector_hidden_dim: int = 64,
         video_hidden_layer: int = 17,
         detach_video_hidden: bool = True,
@@ -503,6 +539,7 @@ class EasyWAMHidden(nn.Module):
             tokenizer=components.tokenizer,
             text_dim=int(video_dit_config["text_dim"]),
             state_dim=int(state_dim),
+            state_position=state_position,
             projector_hidden_dim=int(projector_hidden_dim),
             video_hidden_layer=int(video_hidden_layer),
             detach_video_hidden=bool(detach_video_hidden),
@@ -563,10 +600,6 @@ class EasyWAMHidden(nn.Module):
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        mask = torch.ones_like(mask)
         return prompt_emb.to(device=self.device), mask
 
     @torch.no_grad()
@@ -581,38 +614,13 @@ class EasyWAMHidden(nn.Module):
         self,
         input_image: torch.Tensor,
     ):
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if (
-            input_image.ndim != 4
-            or input_image.shape[0] != 1
-            or input_image.shape[1] != 3
-        ):
-            raise ValueError(
-                "`input_image` must have shape [1,3,H,W] or [3,H,W], "
-                f"got {tuple(input_image.shape)}"
-            )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode(
-            [image],
-            device=self.device,
-        )
-        if isinstance(z, list):
-            z = z[0].unsqueeze(0)
-        return z
+        return encode_image_batch(self.vae, input_image, self.device)
 
     def _decode_latents(
         self,
         latents,
     ):
-        video_tensor = self.vae.decode(latents, device=self.device)
-        video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
-        video_tensor = ((video_tensor + 1.0) * 127.5).to(torch.uint8).cpu()
-        frames = []
-        for t in range(video_tensor.shape[1]):
-            frame = video_tensor[:, t].permute(1, 2, 0).numpy()
-            frames.append(Image.fromarray(frame))
-        return frames
+        return decode_video_batch(self.vae, latents, self.device)
 
     def build_inputs(self, sample):
         video = sample["video"]
@@ -730,7 +738,7 @@ class EasyWAMHidden(nn.Module):
 
     def _prepare_context(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -851,30 +859,34 @@ class EasyWAMHidden(nn.Module):
     def _prepare_inference_inputs(
         self,
         *,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
         proprio: Optional[torch.Tensor],
         context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor],
-        seed: Optional[int],
+        seed: Optional[Union[int, Sequence[Optional[int]]]],
         rand_device: str,
     ) -> dict[str, torch.Tensor]:
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[:2] != (1, 3):
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError(
-                "`input_image` must be [1,3,H,W] or [3,H,W], "
+                "`input_image` must be [B,3,H,W] or [3,H,W], "
                 f"got {tuple(input_image.shape)}"
             )
+        batch_size = int(input_image.shape[0])
         if proprio is None:
             raise ValueError("EasyWAM-Hidden inference requires `proprio` as state.")
         if proprio.ndim == 1:
             proprio = proprio.view(1, 1, -1)
         elif proprio.ndim == 2:
-            proprio = proprio.unsqueeze(0)
-        if proprio.ndim != 3 or proprio.shape[-1] != self.state_dim:
+            if proprio.shape[0] == batch_size:
+                proprio = proprio.unsqueeze(1)
+            elif batch_size == 1:
+                proprio = proprio.unsqueeze(0)
+        if proprio.ndim != 3 or proprio.shape[0] != batch_size or proprio.shape[-1] != self.state_dim:
             raise ValueError(
                 f"`proprio` must end in state_dim={self.state_dim}, got {tuple(proprio.shape)}"
             )
@@ -895,33 +907,21 @@ class EasyWAMHidden(nn.Module):
         latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
-        video_generator = (
-            None
-            if seed is None
-            else torch.Generator(device=rand_device).manual_seed(seed)
-        )
-        action_generator = (
-            None
-            if seed is None
-            else torch.Generator(device=rand_device).manual_seed(seed)
-        )
-        latents_video = torch.randn(
-            (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
-            generator=video_generator,
-            device=rand_device,
-            dtype=torch.float32,
+        latents_video = randn_per_sample(
+            (self.vae.model.z_dim, latent_t, latent_h, latent_w), seeds=seed,
+            batch_size=batch_size, rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_dim),
-            generator=action_generator,
-            device=rand_device,
-            dtype=torch.float32,
+        latents_action = randn_per_sample(
+            (action_horizon, self.action_dim), seeds=seed,
+            batch_size=batch_size, rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(
             input_image=input_image.to(device=self.device, dtype=self.torch_dtype),
         )
         latents_video[:, :, 0:1] = first_frame_latents
         context, context_mask = self._prepare_context(prompt, context, context_mask)
+        if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+            raise ValueError("Context batch size must match input_image batch size.")
         return {
             "latents_video": latents_video,
             "latents_action": latents_action,
@@ -932,9 +932,9 @@ class EasyWAMHidden(nn.Module):
         }
 
     @torch.inference_mode()
-    def infer_action(
+    def infer_action_batch(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         action_horizon: int,
         proprio: Optional[torch.Tensor] = None,
@@ -945,7 +945,7 @@ class EasyWAMHidden(nn.Module):
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
-        seed: Optional[int] = None,
+        seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
         **kwargs,
     ) -> dict[str, Any]:
@@ -981,7 +981,7 @@ class EasyWAMHidden(nn.Module):
         )
         _, video_hidden, video_token_mask = self.forward_video(
             x=inputs["latents_video"],
-            timestep=video_timesteps[0].unsqueeze(0),
+            timestep=video_timesteps[0].expand(inputs["latents_video"].shape[0]),
             context=inputs["context"],
             context_mask=inputs["context_mask"],
             fuse_vae_embedding_in_latents=bool(
@@ -1018,7 +1018,7 @@ class EasyWAMHidden(nn.Module):
         for step_t, step_delta in zip(action_timesteps, action_deltas):
             pred_action = self.forward_action(
                 action=latents_action,
-                timestep=step_t.unsqueeze(0),
+                timestep=step_t.expand(latents_action.shape[0]),
                 state=inputs["state"],
                 video_hidden=video_hidden,
                 video_token_mask=video_token_mask,
@@ -1029,13 +1029,13 @@ class EasyWAMHidden(nn.Module):
                 pred_action, step_delta, latents_action
             )
         return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)
+            "action": latents_action.detach().to(device="cpu", dtype=torch.float32)
         }
 
     @torch.inference_mode()
-    def infer_joint(
+    def infer_joint_batch(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
@@ -1047,7 +1047,7 @@ class EasyWAMHidden(nn.Module):
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
-        seed: Optional[int] = None,
+        seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
         **kwargs,
     ) -> dict[str, Any]:
@@ -1094,7 +1094,7 @@ class EasyWAMHidden(nn.Module):
         ):
             pred_video, current_hidden, current_mask = self.forward_video(
                 x=latents_video,
-                timestep=step_t_video.unsqueeze(0),
+                timestep=step_t_video.expand(latents_video.shape[0]),
                 context=inputs["context"],
                 context_mask=inputs["context_mask"],
                 fuse_vae_embedding_in_latents=bool(
@@ -1116,7 +1116,7 @@ class EasyWAMHidden(nn.Module):
                     )
             pred_action = self.forward_action(
                 action=latents_action,
-                timestep=step_t_action.unsqueeze(0),
+                timestep=step_t_action.expand(latents_action.shape[0]),
                 state=inputs["state"],
                 video_hidden=cached_hidden,
                 video_token_mask=cached_mask,
@@ -1136,8 +1136,23 @@ class EasyWAMHidden(nn.Module):
 
         return {
             "video": self._decode_latents(latents_video),
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": latents_action.detach().to(device="cpu", dtype=torch.float32),
         }
+
+    @torch.inference_mode()
+    def infer_action(self, *args, **kwargs) -> dict[str, Any]:
+        validate_single_inference_image(args, kwargs)
+        result = self.infer_action_batch(*args, **kwargs)
+        return {"action": result["action"][0]}
+
+    @torch.inference_mode()
+    def infer_joint(self, *args, **kwargs) -> dict[str, Any]:
+        validate_single_inference_image(args, kwargs)
+        result = self.infer_joint_batch(*args, **kwargs)
+        result["action"] = result["action"][0]
+        if result["video"] and isinstance(result["video"][0], list):
+            result["video"] = result["video"][0]
+        return result
 
     @torch.inference_mode()
     def infer(
@@ -1191,8 +1206,9 @@ class EasyWAMHidden(nn.Module):
                 "dit": self.dit.state_dict(),
                 "step": step,
                 "torch_dtype": str(self.torch_dtype),
-                "backbone_name": getattr(self, "backbone_name", "wan22"),
+                "backbone_name": self.backbone_name,
             }
+        payload["state_position"] = self.state_position
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1205,11 +1221,12 @@ class EasyWAMHidden(nn.Module):
         )
 
         payload = torch.load(path, map_location="cpu")
+        validate_checkpoint_state_position(payload, self.state_position)
         checkpoint_backbone = payload.get("backbone_name")
-        if checkpoint_backbone is not None and checkpoint_backbone != getattr(self, "backbone_name", "wan22"):
+        if checkpoint_backbone is not None and checkpoint_backbone != self.backbone_name:
             raise ValueError(
                 f"Checkpoint backbone {checkpoint_backbone!r} does not match model backbone "
-                f"{getattr(self, 'backbone_name', 'wan22')!r}."
+                f"{self.backbone_name!r}."
             )
         if is_lora_checkpoint(payload):
             load_lora_model_checkpoint_state(

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
 
 from utils.logging_config import get_logger
 
-from .component.attention import AttentionSegment, StructuredAttentionMask, build_structured_attention_mask
+from .component.attention import (
+    AttentionSegment,
+    KeyPaddingMask,
+    StructuredAttentionMask,
+    build_structured_attention_mask,
+)
 from .easywam_mot_joint import EasyWAMMoTJoint
+from .helpers.batching import randn_per_sample
 
 logger = get_logger(__name__)
 
@@ -207,6 +213,9 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
             context=context,
             context_mask=context_mask,
         )
+        action_pre = self._append_state_to_action_sequence(
+            action_pre, inputs.get("state")
+        )
 
         noisy_video_seq_len = int(video_pre_noisy["tokens"].shape[1])
         cond_video_seq_len = int(video_pre_cond["tokens"].shape[1])
@@ -222,10 +231,25 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
         merged_video_t_mod = _concat_sequence_values(
             video_pre_noisy["t_mod"], video_pre_cond["t_mod"], dim=1
         )
-        merged_video_context_mask = _concat_sequence_values(
-            video_pre_noisy["context_mask"], video_pre_cond["context_mask"], dim=1
-        ) if video_pre_noisy["context_mask"] is not None else None
-        if merged_video_context_mask is None and video_pre_cond["context_mask"] is not None:
+        noisy_context_mask = video_pre_noisy["context_mask"]
+        cond_context_mask = video_pre_cond["context_mask"]
+        if isinstance(noisy_context_mask, KeyPaddingMask) and isinstance(
+            cond_context_mask, KeyPaddingMask
+        ):
+            if not torch.equal(noisy_context_mask.valid, cond_context_mask.valid):
+                raise ValueError(
+                    "Noisy and conditional video branches must use the same context mask."
+                )
+            merged_video_context_mask = noisy_context_mask
+        elif noisy_context_mask is None and cond_context_mask is None:
+            merged_video_context_mask = None
+        elif isinstance(noisy_context_mask, torch.Tensor) and isinstance(
+            cond_context_mask, torch.Tensor
+        ):
+            merged_video_context_mask = _concat_sequence_values(
+                noisy_context_mask, cond_context_mask, dim=1
+            )
+        else:
             raise ValueError("Noisy and conditional video context masks must be both present or both absent.")
 
         attention_mask = self._build_teacher_forcing_attention_mask(
@@ -299,9 +323,9 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
         return loss_total, loss_dict
 
     @torch.inference_mode()
-    def infer_joint(
+    def infer_joint_batch(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
@@ -313,7 +337,7 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
-        seed: Optional[int] = None,
+        seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
         test_action_with_infer_action: bool = False,
         decode_video: bool = True,
@@ -323,11 +347,11 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [B,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        _, _, height, width = input_image.shape
+        batch_size, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(
             height, width, num_video_frames
         )
@@ -344,8 +368,8 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
                 raise ValueError("`proprio` was provided but `state_dim=None` so state encoding is disabled.")
             if proprio.ndim == 1:
                 proprio = proprio.unsqueeze(0)
-            elif proprio.ndim != 2 or proprio.shape[0] != 1:
-                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            elif proprio.ndim != 2 or proprio.shape[0] != batch_size:
+                raise ValueError(f"`proprio` must be [B,D], got shape {tuple(proprio.shape)}")
             if proprio.shape[1] != self.state_dim:
                 raise ValueError(f"`proprio` last dim must be {self.state_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
@@ -353,19 +377,13 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
         latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
-        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_video = torch.randn(
-            (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
+        latents_video = randn_per_sample(
+            (self.vae.model.z_dim, latent_t, latent_h, latent_w), seeds=seed,
+            batch_size=batch_size, rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
-        action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=action_generator,
-            device=rand_device,
-            dtype=torch.float32,
+        latents_action = randn_per_sample(
+            (action_horizon, self.action_expert.action_dim), seeds=seed,
+            batch_size=batch_size, rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
@@ -395,6 +413,8 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+            raise ValueError("Context batch size must match input_image batch size.")
         if proprio is not None:
             context, context_mask = self._append_state_to_context(
                 context=context,
@@ -412,7 +432,7 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
             shift_override=sigma_shift,
         )
         for step_t_video, step_delta_video in zip(infer_timesteps_video, infer_deltas_video):
-            timestep_video = step_t_video.unsqueeze(0).to(
+            timestep_video = step_t_video.expand(batch_size).to(
                 dtype=latents_video.dtype, device=self.device
             )
             pred_video = self._predict_video_noise(
@@ -444,7 +464,9 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
         video_seq_len = int(video_pre_cond["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
-            action_seq_len=latents_action.shape[1],
+            action_seq_len=(
+                latents_action.shape[1] + self._state_sequence_length(proprio)
+            ),
             video_tokens_per_frame=int(video_pre_cond["meta"]["tokens_per_frame"]),
             device=video_pre_cond["tokens"].device,
         )
@@ -468,7 +490,7 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
             shift_override=sigma_shift,
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-            timestep_action = step_t_action.unsqueeze(0).to(
+            timestep_action = step_t_action.expand(batch_size).to(
                 dtype=latents_action.dtype, device=self.device
             )
             pred_action = self._predict_action_noise_with_cache(
@@ -481,22 +503,23 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
                 video_seq_len=video_seq_len,
                 action_context=action_context,
                 action_cross_kv_cache=action_cross_kv_cache,
+                state=proprio,
             )
             latents_action = self.infer_action_scheduler.step(
                 pred_action, step_delta_action, latents_action
             )
 
         result = {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": latents_action.detach().to(device="cpu", dtype=torch.float32),
         }
         if decode_video:
             result["video"] = self._decode_latents(latents_video)
         return result
 
     @torch.inference_mode()
-    def infer_action(
+    def infer_action_batch(
         self,
-        prompt: Optional[str],
+        prompt: Optional[Union[str, Sequence[str]]],
         input_image: torch.Tensor,
         action_horizon: int,
         num_video_frames: int,
@@ -507,10 +530,10 @@ class EasyWAMMoTIDM(EasyWAMMoTJoint):
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
         sigma_shift: Optional[float] = None,
-        seed: Optional[int] = None,
+        seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
     ) -> dict[str, Any]:
-        out = self.infer_joint(
+        out = self.infer_joint_batch(
             prompt=prompt,
             input_image=input_image,
             num_video_frames=num_video_frames,

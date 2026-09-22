@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import re
@@ -13,6 +12,7 @@ from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
 from data.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from data.lerobot.lerobot.datasets.utils import load_info, load_tasks, load_tasks_v21
 from data.lerobot.text_embedding_cache import (
     build_text_embedding_payload,
     prompt_hash,
@@ -77,9 +77,7 @@ def _collect_dataset_settings(data_cfg: DictConfig):
     context_lens = set()
 
     for node_path, node in _iter_dataset_nodes(data_cfg, path="data"):
-        raw_dirs = node.get("dataset_dirs")
-        if raw_dirs is None:
-            continue
+        raw_dirs = node["dataset_dirs"]
 
         cache_dir = node.get("text_embedding_cache_dir")
         if cache_dir is None or not str(cache_dir).strip():
@@ -121,24 +119,24 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     total_task_rows = 0
 
     for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
+        root = Path(ds_dir)
+        version = str(load_info(root).get("codebase_version"))
+        if version == "v3.0":
+            tasks, _ = load_tasks(root)
+        elif version == "v2.1":
+            tasks, _ = load_tasks_v21(root)
+        else:
+            raise ValueError(
+                f"Unsupported LeRobot dataset version {version!r} at {root}; "
+                "expected v3.0 or v2.1."
+            )
 
-        with tasks_path.open("r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
-                total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+        for task in tasks.values():
+            prompt = DEFAULT_PROMPT.format(task=str(task))
+            total_task_rows += 1
+            if prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
@@ -169,6 +167,35 @@ def _atomic_torch_save(payload: dict[str, Any], output_path: Path):
     tmp_path = output_path.parent / f".{output_path.name}.tmp.{uuid.uuid4().hex}"
     torch.save(payload, str(tmp_path))
     os.replace(tmp_path, output_path)
+
+
+def _cache_filename(prompt_digest: str, context_len: int, encoder_id: str) -> str:
+    if encoder_id == "qwen3_flux2":
+        return f"{prompt_digest}.qwen3_flux2_len{context_len}.pt"
+    return text_embedding_cache_filename(
+        prompt_digest, context_len, encoder_id, is_hash=True
+    )
+
+
+def _cache_payload(
+    context: torch.Tensor,
+    mask: torch.Tensor,
+    context_len: int,
+    encoder_id: str,
+    prompt_digest: str,
+) -> dict[str, Any]:
+    if encoder_id == "qwen3_flux2":
+        return {
+            "text_hidden_states": context,
+            "text_attention_mask": mask,
+        }
+    return build_text_embedding_payload(
+        context=context,
+        mask=mask,
+        context_len=context_len,
+        encoder_id=encoder_id,
+        prompt_digest=prompt_digest,
+    )
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
@@ -205,7 +232,7 @@ def main(cfg: DictConfig):
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
         prompts = _read_unique_prompts(dataset_dirs)
     if not prompts:
-        logger.warning("No prompts found from tasks.jsonl; nothing to do.")
+        logger.warning("No prompts found in the configured datasets; nothing to do.")
         return
 
     if torch.cuda.is_available():
@@ -232,6 +259,11 @@ def main(cfg: DictConfig):
         # Cosmos-Reason bundles the matching tokenizer with the text encoder.
         text_encoder_model_id = str(reason_model_id)
         tokenizer_model_id = str(reason_model_id)
+    elif backbone_name == "flux2":
+        text_encoder_model_id = str(backbone_cfg.qwen3_model_spec)
+        tokenizer_model_id = text_encoder_model_id
+        if enc_id != "qwen3_flux2":
+            raise ValueError("FLUX.2 text cache requires text_encoder_id=qwen3_flux2.")
     else:
         raise ValueError(f"Unsupported backbone for text caching: {backbone_name!r}")
 
@@ -282,6 +314,23 @@ def main(cfg: DictConfig):
             torch_dtype=torch_dtype,
         )
         text_encoder.set_projector(projection)
+    elif backbone_name == "flux2":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from model.backbone.flux2.text_encoder import Flux2Qwen3TextEncoder
+
+        qwen_tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_id)
+        qwen = AutoModelForCausalLM.from_pretrained(
+            text_encoder_model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        ).eval().requires_grad_(False).to(device)
+        text_encoder = Flux2Qwen3TextEncoder(
+            qwen,
+            qwen_tokenizer,
+            output_layers=backbone_cfg.qwen3_output_layers,
+            max_length=context_len,
+        ).eval()
 
     stats = {
         str(cache_dir): {"new": 0, "overwrite": 0, "skip": 0}
@@ -293,12 +342,7 @@ def main(cfg: DictConfig):
         prompts_to_encode: list[str] = []
         for prompt in local_prompts:
             hashed = prompt_hash(prompt)
-            filename = text_embedding_cache_filename(
-                hashed,
-                context_len,
-                enc_id,
-                is_hash=True,
-            )
+            filename = _cache_filename(hashed, context_len, enc_id)
             if all((cache_dir / filename).is_file() for cache_dir in cache_dirs):
                 fully_cached_local += 1
                 for cache_dir in cache_dirs:
@@ -338,7 +382,7 @@ def main(cfg: DictConfig):
         disable=is_distributed and rank != 0,
     ) as pbar:
         with torch.no_grad():
-            encode_batch_size = 1 if backbone_name == "cosmos25" else DEFAULT_BATCH_SIZE
+            encode_batch_size = 1 if backbone_name in {"cosmos25", "flux2"} else DEFAULT_BATCH_SIZE
             for start in range(0, len(local_prompts), encode_batch_size):
                 batch_prompts = local_prompts[start : start + encode_batch_size]
                 if tokenizer is None:
@@ -362,22 +406,11 @@ def main(cfg: DictConfig):
                     hashed = prompt_hash(prompt)
                     context_i = context[i].detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
                     mask_i = mask[i].detach().to(device="cpu", dtype=torch.bool).contiguous()
-                    if backbone_name != "cosmos25":
-                        context_i[~mask_i] = 0
-                        mask_i = torch.ones_like(mask_i)
-                    payload = build_text_embedding_payload(
-                        context=context_i,
-                        mask=mask_i,
-                        context_len=context_len,
-                        encoder_id=enc_id,
-                        prompt_digest=hashed,
+                    context_i[~mask_i] = 0
+                    payload = _cache_payload(
+                        context_i, mask_i, context_len, enc_id, hashed
                     )
-                    filename = text_embedding_cache_filename(
-                        hashed,
-                        context_len,
-                        enc_id,
-                        is_hash=True,
-                    )
+                    filename = _cache_filename(hashed, context_len, enc_id)
                     for cache_dir in cache_dirs:
                         cache_path = cache_dir / filename
                         key = str(cache_dir)
