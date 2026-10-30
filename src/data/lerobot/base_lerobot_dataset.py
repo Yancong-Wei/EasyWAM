@@ -5,9 +5,11 @@ from typing import List, Literal, Dict, Optional, Any, DefaultDict, Sequence
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from utils.logging_config import get_logger
 from .processors.base_processor import BaseProcessor
+from .resources import reuse_during_construction, shared_resource
 
 logger = get_logger(__name__)
 
@@ -36,6 +38,7 @@ def resolve_image_obs_indices(
 
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
+    @reuse_during_construction
     def __init__(
         self,
         dataset_dirs: List[str],
@@ -69,7 +72,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for ds_dir in dataset_dirs:
             ds_root = Path(ds_dir)
             repo_id = ds_dir
-            meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
+            meta = shared_resource(("metadata", str(ds_root.resolve()), "v3.0"), lambda: LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root))
             metas.append(meta)
 
         fps_list = [m.fps for m in metas]
@@ -125,9 +128,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
+            image_output_dtype=torch.uint8,
         )
         
-        # Convert local episode offsets to positions in the combined dataset.
         episode_data_index = []
         end_index = 0
         for dataset in self.multi_dataset._datasets:
@@ -146,24 +149,23 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
         action: torch.Tensor = lerobot_sample[lerobot_key]
-        if action.ndim == 1:
-            action = action.unsqueeze(-1)
+        if raw_shape == 1:
+            action = action.reshape(action.shape[0], 1)
         assert action.shape[-1] == raw_shape, f"Action '{key}' shape {action.shape[-1]} mismatch with meta {raw_shape}."
         return action
 
     def _get_state(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
         state: torch.Tensor = lerobot_sample[lerobot_key]
-        if state.ndim == 1:
-            state = state.unsqueeze(-1)
+        if raw_shape == 1:
+            state = state.reshape(state.shape[0], 1)
         assert state.shape[-1] == raw_shape, f"State '{key}' shape {state.shape[-1]} mismatch with meta {raw_shape}."
         return state
     
     def _get_image(self, meta, lerobot_sample) -> torch.Tensor:
         image: torch.Tensor = lerobot_sample[meta["lerobot_key"]]
-        if image.ndim == 3:
-            image = image.unsqueeze(0)        
-        image = (image * 255).to(torch.uint8)
+        if image.ndim != 4 or image.dtype != torch.uint8:
+            raise ValueError("LeRobot images must be uint8 [T,C,H,W].")
         return image
     
     def _split_lerobot_sample(self, lerobot_sample) -> Dict[str, Any]:
@@ -196,7 +198,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds {len(self)}.")
 
-        # Retry a failed frame read with another sample.
         sample_idx = idx
         attempt = 0
         last_exception: Optional[Exception] = None
@@ -252,7 +253,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         return sample
 
     def set_processor(self, processor: BaseProcessor):
-        """Set processor instance from external initialization."""
         self.processor = processor
         if self.is_training_set:
             self.processor.train()
@@ -278,35 +278,39 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         episodes_num = self.multi_dataset.num_episodes
         
         def process_episode(episode_idx):
-            batch = self._get_episode_data(episode_idx) 
-            batch = preprocessor.action_state_transform(batch)
-            return batch
-        
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(process_episode, num) for num in range(episodes_num)]
-            for future in tqdm(as_completed(futures), total=episodes_num, desc="Iterating dataset to get normalization"):
-                batch = future.result()
-                for meta in self.state_meta:
+            batch = preprocessor.action_state_transform(self._get_episode_data(episode_idx))
+            compact = {"state": {}, "action": {}}
+            for kind, metas in (("state", self.state_meta), ("action", self.action_meta)):
+                for meta in metas:
                     key = meta["key"]
-                    cur_state: torch.Tensor = batch["state"][key]
-                    state_min[key].append(cur_state.amin(0))
-                    state_max[key].append(cur_state.amax(0))
-                    state_mean[key].append(cur_state.mean(0))
-                    state_var[key].append(cur_state.var(0))
-                    state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
-                    state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
+                    values = batch[kind][key]
+                    quantiles = torch.quantile(values, torch.tensor([0.01, 0.99], dtype=values.dtype, device=values.device), dim=0)
+                    compact[kind][key] = (values.amin(0), values.amax(0), values.mean(0), values.var(0), quantiles[0], quantiles[1])
+            return compact
 
-                for meta in self.action_meta:
-                    key = meta["key"]
-                    cur_action: torch.Tensor = batch["action"][key]
-                    action_min[key].append(cur_action.amin(0))
-                    action_max[key].append(cur_action.amax(0))
-                    action_mean[key].append(cur_action.mean(0))
-                    action_var[key].append(cur_action.var(0))
-                    action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
-                    action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
+        accumulators = {
+            "state": (state_min, state_max, state_mean, state_var, state_q01, state_q99),
+            "action": (action_min, action_max, action_mean, action_var, action_q01, action_q99),
+        }
+        worker_count = min(4, os.cpu_count() or 1)
+        episode_iter = iter(range(episodes_num))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor, tqdm(total=episodes_num, desc="Iterating dataset to get normalization") as progress:
+            pending = set()
+            for _ in range(min(episodes_num, worker_count * 2)):
+                pending.add(executor.submit(process_episode, next(episode_iter)))
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    compact = future.result()
+                    for kind, fields in compact.items():
+                        for key, values in fields.items():
+                            for accumulator, value in zip(accumulators[kind], values):
+                                accumulator[key].append(value)
+                    progress.update(1)
+                    next_episode = next(episode_iter, None)
+                    if next_episode is not None:
+                        pending.add(executor.submit(process_episode, next_episode))
 
-        # Aggregate episode statistics across equally sized windows.
         def get_mean_std(means, vars):
             means = torch.stack(means)
             vars = torch.stack(vars)
@@ -355,7 +359,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
 
 def sliding_window_with_replication(x: torch.Tensor, window_size: int) -> torch.Tensor:
-    """Build sliding windows by repeating the last row at the boundary."""
     assert x.dim() == 2
     assert window_size > 0
     

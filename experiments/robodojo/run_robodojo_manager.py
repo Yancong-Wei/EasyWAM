@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import hydra
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +27,7 @@ from experiments.robodojo.result_utils import (  # noqa: E402
     latest_valid_result,
     result_parent,
     summarize_jobs,
+    aggregate_rows,
 )
 from experiments.robodojo.upstream import (  # noqa: E402
     build_client_command,
@@ -40,6 +40,8 @@ from experiments.task_dispatch import (  # noqa: E402
     build_worker_slots,
     resolve_gpu_ids,
 )
+
+from experiments.robodojo.run_identity import evaluation_identity, bind_output, evaluation_lock, source_digest
 
 SERVER_ENTRY = PROJECT_ROOT / "experiments/robodojo/policy_server.py"
 POLICY_CONFIG = PROJECT_ROOT / "experiments/robodojo/easywam_policy/deploy_policy.yml"
@@ -56,6 +58,8 @@ def _resolve_dataset_stats_path(cfg: DictConfig, checkpoint: Path) -> Path:
     explicit = None
     if value is not None and str(value).strip().lower() not in {"", "none", "null"}:
         explicit = _resolve_path(str(value))
+    if explicit is not None and not explicit.is_file():
+        raise FileNotFoundError(f"Explicit normalization statistics do not exist: {explicit}")
     candidates = ([explicit] if explicit is not None else []) + [
         (parent / "dataset_stats.json").resolve()
         for parent in list(checkpoint.parents)[:4]
@@ -79,12 +83,13 @@ def _format_override_value(value: Any) -> str:
     return repr(str(value))
 
 
-def _model_overrides(cfg: DictConfig, checkpoint: Path, dataset_stats: Path) -> list[str]:
+def _model_overrides(cfg: DictConfig, checkpoint: Path, dataset_stats: Path, resolved_config: Path) -> list[str]:
     values = {
         "ckpt_setting": str(checkpoint),
+        "resolved_sim_cfg_path": str(resolved_config),
         "seed": cfg.seed,
         "sim_cfg_path": str(SIM_CONFIG.resolve()),
-        "sim_task": HydraConfig.get().runtime.choices.get("task"),
+        "sim_task": None,
         "mixed_precision": cfg.mixed_precision,
         "device": cfg.EVALUATION.device,
         "dataset_stats_path": str(dataset_stats),
@@ -131,15 +136,6 @@ def _wait_for_server(process: subprocess.Popen, port: int, timeout: float = 600)
     raise TimeoutError(f"Timed out waiting for policy server on port {port}.")
 
 
-def _checkpoint_tag(checkpoint: Path) -> str:
-    parts = checkpoint.parts
-    if "runs" in parts:
-        index = parts.index("runs")
-        if index + 2 < len(parts):
-            return f"{parts[index + 1]}_{parts[index + 2]}"
-    return checkpoint.stem
-
-
 def _select_jobs(records: list[dict], task_name: str | None, seeds: list[int], episode_override: int | None) -> list[dict]:
     if not seeds or any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
         raise ValueError("seeds must be a nonempty list of distinct non-negative integers.")
@@ -180,81 +176,7 @@ def create_task_file(path: Path, jobs: list[dict]) -> Path:
 def _write_summary(output_dir: Path, jobs: list[dict], root: Path, env_cfg_type: str, tag: str) -> list[dict]:
     rows = summarize_jobs(jobs, root, env_cfg_type, tag)
     output_dir.mkdir(parents=True, exist_ok=True)
-    by_task: dict[tuple[str, int], dict[str, dict]] = {}
-    for row in rows:
-        base = row["task_name"].removesuffix("_random")
-        by_task.setdefault((base, row["seed"]), {})[
-            "random" if row["task_name"].endswith("_random") else "standard"
-        ] = row
-    per_task = []
-    for (task_name, seed), phases in sorted(by_task.items()):
-        if "standard" not in phases and "random" in phases:
-            entry = phases["random"]
-            per_task.append({
-                "task_name": entry["task_name"], "dimension": entry["dimension"],
-                "seed": seed, "complete": entry["complete"],
-                **({"success_rate": entry["success_rate"], "score": entry["score"]}
-                   if entry["complete"] else {}),
-            })
-            continue
-        required = ("standard", "random") if phases.get("standard", {}).get("dimension") == "generalization" else ("standard",)
-        if not all(phases.get(name, {}).get("complete") for name in required):
-            per_task.append({"task_name": task_name, "seed": seed, "complete": False})
-            continue
-        entries = [phases[name] for name in required]
-        count = sum(entry["episodes"] for entry in entries)
-        per_task.append({
-            "task_name": task_name, "dimension": entries[0]["dimension"], "seed": seed,
-            "complete": True,
-            "success_rate": sum(entry["success_rate"] * entry["episodes"] for entry in entries) / count,
-            "score": sum(entry["score"] * entry["episodes"] for entry in entries) / count,
-        })
-    dimension_scores = {}
-    for dimension in sorted({row["dimension"] for row in per_task if row["complete"]}):
-        values = [row for row in per_task if row["complete"] and row["dimension"] == dimension]
-        by_seed_values: dict[int, list[dict]] = {}
-        for row in values:
-            by_seed_values.setdefault(row["seed"], []).append(row)
-        dimension_scores[dimension] = {
-            metric: sum(
-                sum(row[metric] for row in seed_rows) / len(seed_rows)
-                for seed_rows in by_seed_values.values()
-            ) / len(by_seed_values)
-            for metric in ("success_rate", "score")
-        } | {
-            "completed_cells": len(values),
-        }
-    complete_cells = [row for row in per_task if row["complete"]]
-    seed_dimensions: dict[int, dict[str, list[dict]]] = {}
-    for row in complete_cells:
-        seed_dimensions.setdefault(row["seed"], {}).setdefault(row["dimension"], []).append(row)
-    seed_overall = []
-    for dimension_rows in seed_dimensions.values():
-        seed_overall.append({
-            metric: sum(
-                sum(row[metric] for row in values) / len(values)
-                for values in dimension_rows.values()
-            ) / len(dimension_rows)
-            for metric in ("success_rate", "score")
-        })
-    summary = {
-        "jobs": rows,
-        "per_task_seed": per_task,
-        "dimensions": dimension_scores,
-        "overall": {
-            "completed_cells": len(complete_cells),
-            "expected_cells": len(per_task),
-            "complete": len(complete_cells) == len(per_task),
-            "success_rate": (
-                sum(row["success_rate"] for row in seed_overall) / len(seed_overall)
-                if seed_overall else None
-            ),
-            "score": (
-                sum(row["score"] for row in seed_overall) / len(seed_overall)
-                if seed_overall else None
-            ),
-        },
-    }
+    summary = aggregate_rows(rows)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -345,9 +267,19 @@ def _write_official_summary(root: Path) -> None:
 
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="benchmark/sim_robodojo.yaml")
 def main(cfg: DictConfig) -> None:
+    output = _resolve_path(str(cfg.EVALUATION.output_dir))
+    with evaluation_lock(output):
+        run_evaluation(cfg)
+
+
+def run_evaluation(cfg: DictConfig) -> None:
     if str(cfg.EVALUATION.action_type) != "joint":
         raise ValueError("RoboDojo EasyWAM evaluation requires action_type=joint.")
-    root = validate_robodojo_root(_resolve_path(str(cfg.EVALUATION.robodojo_root), base=PROJECT_ROOT))
+    create_only = bool(cfg.MULTIRUN.get("create_only", False))
+    root = validate_robodojo_root(
+        _resolve_path(str(cfg.EVALUATION.robodojo_root), base=PROJECT_ROOT),
+        require_policy=not create_only,
+    )
     records = load_inventory(root)
     if cfg.EVALUATION.task_name is None:
         canonical = [record for record in records if record.get("variant") == "standard"]
@@ -362,7 +294,6 @@ def main(cfg: DictConfig) -> None:
     jobs = _select_jobs(records, cfg.EVALUATION.task_name, list(cfg.EVALUATION.seeds), override)
     if not jobs:
         raise ValueError("No RoboDojo jobs selected.")
-    create_only = bool(cfg.MULTIRUN.get("create_only", False))
     checkpoint = None
     stats = None
     if not create_only:
@@ -374,18 +305,41 @@ def main(cfg: DictConfig) -> None:
         stats = _resolve_dataset_stats_path(cfg, checkpoint)
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
     output_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg, output_dir / "manager_config.yaml")
+
     task_file_value = cfg.MULTIRUN.get("task_file")
     selected_task_file = (
         _resolve_path(str(task_file_value), base=PROJECT_ROOT)
         if task_file_value else output_dir / "tasks.jsonl"
     )
-    create_task_file(selected_task_file, jobs)
     if create_only:
+        if (output_dir / "evaluation_identity.json").exists():
+            raise ValueError("Do not overwrite an evaluated run with a planning-only job list.")
+        create_task_file(selected_task_file, jobs)
         return
     assert checkpoint is not None and stats is not None
     install_policy_adapter(root)
-    tag = _checkpoint_tag(checkpoint)
+    settings = OmegaConf.to_container(cfg, resolve=True)
+    # Output paths and worker placement do not define policy semantics.
+    settings.pop("hydra", None)
+    settings.pop("output_dir", None)
+    multirun_settings = settings.pop("MULTIRUN", {})
+    settings["inference_batching"] = {key: multirun_settings.get(key) for key in (
+        "inference_batch_size", "inference_batch_wait_ms", "prompt_cache_size"
+    )}
+    settings["EVALUATION"].pop("output_dir", None)
+    settings["jobs"] = jobs
+    settings["easywam_source_digest"] = source_digest(PROJECT_ROOT)
+    for name, checkout in (("easywam", PROJECT_ROOT), ("robodojo", root), ("xpolicylab", root / "XPolicyLab")):
+        revision = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True)
+        settings[name + "_revision"] = revision.stdout.strip() if revision.returncode == 0 else "unknown"
+    identity = evaluation_identity(checkpoint, stats, settings)
+    bind_output(output_dir, identity)
+    create_task_file(selected_task_file, jobs)
+    if selected_task_file != output_dir / "tasks.jsonl":
+        create_task_file(output_dir / "tasks.jsonl", jobs)
+    tag = identity["tag"]
+    resolved_config = output_dir / "manager_config.yaml"
+    OmegaConf.save(cfg, resolved_config, resolve=True)
     pending = [
         job for job in jobs
         if latest_valid_result(
@@ -435,7 +389,7 @@ def main(cfg: DictConfig) -> None:
     cursor_file.write_text("0", encoding="utf-8")
     dispatcher = FileTaskDispatcher(task_file, cursor_file)
     claim_lock = threading.Lock()
-    model_overrides = _model_overrides(cfg, checkpoint, stats)
+    model_overrides = _model_overrides(cfg, checkpoint, stats, resolved_config)
     servers: list[subprocess.Popen] = []
     clients: list[subprocess.Popen] = []
     handles = []

@@ -12,7 +12,7 @@ output_dir: ./runs/train/${now:%Y-%m-%d}_${now:%H-%M-%S}
 # dataloading
 batch_size: 16
 num_workers: 8
-dataloader_prefetch_factor: 16
+dataloader_prefetch_factor: 2
 dataloader_persistent_workers: true
 dataloader_pin_memory: true
 dataloader_worker_threads: 1
@@ -34,7 +34,7 @@ eval_save_video: false
 
 # training
 gradient_accumulation_steps: 1
-mixed_precision: "bf16" # one of: [no, fp16, bf16]
+mixed_precision: "bf16"
 seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0

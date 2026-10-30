@@ -5,19 +5,21 @@ from omegaconf import OmegaConf
 
 
 def _register(name: str, func: Callable) -> None:
-    """Idempotently register a resolver, replacing any existing one."""
     OmegaConf.register_new_resolver(name, func, replace=True)
 
 def _oc_load(path: str, key: Optional[str] = None) -> Any:
-    """
-    Load a YAML/JSON config and optionally select a key.
-    Paths are resolved relative to the current working directory.
-    """
     load_path = Path(path)
     cfg = OmegaConf.load(load_path)
     if key is None or key == "":
         return cfg
     return OmegaConf.select(cfg, key)
+
+
+def validate_choice(value: Any, *choices: Any) -> Any:
+    if value not in choices:
+        allowed = ", ".join(repr(choice) for choice in choices)
+        raise ValueError(f"Expected one of {allowed}, got {value!r}.")
+    return value
 
 def sum_shapes(shape_meta_list):
     if not shape_meta_list:
@@ -49,13 +51,10 @@ def max_state_dim(embodiment_datasets_cfg):
     return max_dim
 
 def register_default_resolvers() -> None:
-    """
-    Register all resolvers commonly used across entrypoints.
-    Safe to call multiple times.
-    """
     _register("oc.load", _oc_load)
-    _register("eval", eval) # allows arbitrary python code execution in configs using the ${eval:''} resolver
-    _register("split", lambda s, idx: s.split('/')[int(idx)]) # split string
+    _register("validate_choice", validate_choice)
+    _register("eval", eval)
+    _register("split", lambda s, idx: s.split('/')[int(idx)])
     _register("max", lambda x: max(x))
     _register("round_up", math.ceil)
     _register("round_down", math.floor)

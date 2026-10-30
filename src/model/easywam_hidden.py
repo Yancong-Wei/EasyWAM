@@ -11,16 +11,27 @@ from .component.action_dit import (
     StateEncoder,
     normalize_state_position,
     validate_checkpoint_state_position,
+    policy_action_config,
+    validate_policy_action_config,
 )
-from .component.attention import elide_fully_valid_attention_mask
+from .component.attention import (
+    elide_fully_valid_attention_mask,
+    prepare_key_padding_mask,
+)
 from .helpers.gradient import gradient_checkpoint_forward
 from .helpers.batching import (
+    ActionInferenceResult,
+    JointInferenceResult,
+    ActionBatchResult,
+    JointBatchResult,
     decode_video_batch,
     encode_image_batch,
     randn_per_sample,
-    validate_single_inference_image,
+    batch_single_tensor,
+    batch_single_state,
+    validate_batch_inputs,
 )
-from .backbone.wan22.loader import load_wan22_ti2v_5b_components
+from .helpers import endpoint
 from .schedulers.scheduler_continuous import ContinuousFlowMatchScheduler
 
 
@@ -28,7 +39,11 @@ logger = get_logger(__name__)
 
 
 class EasyWAMHidden(nn.Module):
-    """EasyWAM-Hidden model with cached video-hidden action conditioning."""
+
+    _forward_endpoint = endpoint.predict
+    _forward_endpoint_cached_action = endpoint._cached_action
+
+    model_variant = "hidden"
 
     inference_compile_targets = ("forward_video", "forward_action")
 
@@ -57,7 +72,13 @@ class EasyWAMHidden(nn.Module):
         loss_lambda_action: float = 1.0,
     ):
         super().__init__()
-        self.backbone_name = getattr(video_dit, "backbone_name", "wan22")
+        self.inference_cross_kv_reuse = False
+        self.backbone_name = video_dit.backbone_name
+        if getattr(video_dit, "visual_target", None) == "endpoint":
+            self.inference_compile_targets = (
+                "_forward_endpoint",
+                "_forward_endpoint_cached_action",
+            )
         self.dit = nn.ModuleDict(
             {
                 "video_dit": video_dit,
@@ -73,6 +94,10 @@ class EasyWAMHidden(nn.Module):
                 ),
             }
         )
+        if not action_dit.cross_attention:
+            raise ValueError(
+                "Hidden requires an ActionDiT with cross_attention enabled"
+            )
         self.action_dim = int(action_dit.action_dim)
         self.state_dim = int(state_dim)
         self.state_position = normalize_state_position(state_position)
@@ -163,9 +188,11 @@ class EasyWAMHidden(nn.Module):
         image_is_pad = image_is_pad.to(device=device, dtype=torch.bool)
         if not bool(image_is_pad.any().item()):
             return None
-        tail_is_pad = image_is_pad[:, 1:].view(
-            image_is_pad.shape[0], -1, temporal_factor
-        ).all(dim=2)
+        tail_is_pad = (
+            image_is_pad[:, 1:]
+            .view(image_is_pad.shape[0], -1, temporal_factor)
+            .all(dim=2)
+        )
         latent_is_pad = torch.cat([image_is_pad[:, :1], tail_is_pad], dim=1)
         if latent_is_pad.shape[1] != latent_frames:
             raise ValueError(
@@ -218,6 +245,7 @@ class EasyWAMHidden(nn.Module):
         captured_hidden = None
         for layer_index, block in enumerate(self.video_dit.blocks):
             if self.video_dit.use_gradient_checkpointing:
+
                 def _block_forward(value, index=layer_index):
                     return self.video_dit.forward_block(
                         index, value, video_pre, self_attn_mask
@@ -233,7 +261,9 @@ class EasyWAMHidden(nn.Module):
                     layer_index, tokens, video_pre, self_attn_mask
                 )
             if layer_index == self.video_hidden_layer:
-                captured_hidden = tokens.detach() if self.detach_video_hidden else tokens
+                captured_hidden = (
+                    tokens.detach() if self.detach_video_hidden else tokens
+                )
                 if not return_prediction:
                     break
 
@@ -246,33 +276,10 @@ class EasyWAMHidden(nn.Module):
         )
         return prediction, captured_hidden, video_token_mask
 
-    def forward_action(
-        self,
-        action: torch.Tensor,
-        timestep: torch.Tensor,
-        state: torch.Tensor,
-        video_hidden: torch.Tensor,
-        video_token_mask: Optional[torch.Tensor] = None,
-        projected_context: Optional[torch.Tensor] = None,
-        cross_kv_cache: Optional[tuple[tuple[torch.Tensor, torch.Tensor], ...]] = None,
-    ) -> torch.Tensor:
-        if state.ndim == 2:
-            state = state.unsqueeze(1)
-        if state.ndim != 3 or state.shape[-1] != self.state_dim:
-            raise ValueError(
-                f"`state` must be [B,S,{self.state_dim}], got {tuple(state.shape)}"
-            )
-
-        video_context = (
-            self.action_dit.project_context(
-                self.dit["video_context_projector"](video_hidden)
-            )
-            if projected_context is None
-            else projected_context
-        )
-        state_tokens = self.dit["state_encoder"](
-            state.to(device=action.device, dtype=action.dtype)
-        ).to(dtype=video_context.dtype)
+    def _prepare_action_condition(
+        self, state, video_context, video_token_mask, cross_kv_cache
+    ):
+        state_tokens = self.dit["state_encoder"](state).to(dtype=video_context.dtype)
         action_context = video_context
         action_context_mask = video_token_mask
         action_cross_kv_cache = cross_kv_cache
@@ -303,45 +310,61 @@ class EasyWAMHidden(nn.Module):
                         cross_kv_cache, state_kv_cache
                     )
                 )
+        return {
+            "state_tokens": state_tokens,
+            "context": action_context,
+            "context_mask": prepare_key_padding_mask(action_context_mask),
+            "cross_kv_cache": action_cross_kv_cache,
+        }
+
+    def forward_action(
+        self,
+        action: torch.Tensor,
+        timestep: torch.Tensor,
+        state: torch.Tensor,
+        video_hidden: torch.Tensor,
+        video_token_mask: Optional[torch.Tensor] = None,
+        projected_context: Optional[torch.Tensor] = None,
+        cross_kv_cache: Optional[tuple[tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        prepared_condition: Optional[dict] = None,
+    ) -> torch.Tensor:
+        if state.ndim != 3 or state.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"`state` must be [B,S,{self.state_dim}], got {tuple(state.shape)}"
+            )
+
+        video_context = (
+            self.action_dit.project_context(
+                self.dit["video_context_projector"](video_hidden)
+            )
+            if projected_context is None
+            else projected_context
+        )
+        condition = prepared_condition
+        if condition is None:
+            condition = self._prepare_action_condition(
+                state.to(device=action.device, dtype=action.dtype),
+                video_context,
+                video_token_mask,
+                cross_kv_cache,
+            )
         action_pre = self.action_dit.pre_dit(
             action_tokens=action,
-            timestep=timestep,
-            context=action_context,
-            context_mask=action_context_mask,
+            timestep=(
+                timestep / self.train_action_scheduler.num_train_timesteps
+                if self.action_dit.preset == "staged"
+                else timestep
+            ),
+            context=condition["context"],
+            context_mask=condition["context_mask"],
             context_is_projected=True,
-            cross_kv_cache=action_cross_kv_cache,
+            cross_kv_cache=condition["cross_kv_cache"],
         )
         if self.state_position == "sequence":
-            action_pre = self.action_dit.append_state_tokens(action_pre, state_tokens)
-        tokens = action_pre["tokens"]
-
-        for layer_index, block in enumerate(self.action_dit.blocks):
-            context_kv = (
-                None
-                if action_pre["cross_kv_cache"] is None
-                else action_pre["cross_kv_cache"][layer_index]
+            action_pre = self.action_dit.append_state_tokens(
+                action_pre, condition["state_tokens"]
             )
-            if self.action_dit.use_gradient_checkpointing:
-                tokens = gradient_checkpoint_forward(
-                    block,
-                    self.action_dit.use_gradient_checkpointing,
-                    tokens,
-                    action_pre["context"],
-                    action_pre["t_mod"],
-                    action_pre["freqs"],
-                    context_mask=action_pre["context_mask"],
-                    context_kv=context_kv,
-                )
-            else:
-                tokens = block(
-                    tokens,
-                    action_pre["context"],
-                    action_pre["t_mod"],
-                    action_pre["freqs"],
-                    context_mask=action_pre["context_mask"],
-                    context_kv=context_kv,
-                )
-        return self.action_dit.post_dit(tokens, action_pre)
+        return self.action_dit.forward_prepared(action_pre)
 
     def _forward_dit(
         self,
@@ -377,7 +400,6 @@ class EasyWAMHidden(nn.Module):
             raise RuntimeError("Video prediction is required during joint forward.")
         return pred_video, pred_action
 
-
     @classmethod
     def from_backbone_pretrained(
         cls,
@@ -403,7 +425,7 @@ class EasyWAMHidden(nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
     ) -> "EasyWAMHidden":
-        from .backbone.loader import load_easywam_backbone, normalize_backbone_config
+        from .backbone import load_easywam_backbone, normalize_backbone_config
 
         cfg = normalize_backbone_config(backbone)
         action_cfg = dict(action_dit_config)
@@ -445,125 +467,25 @@ class EasyWAMHidden(nn.Module):
             loss_lambda_action=loss_lambda_action,
         )
         model.backbone_name = cfg["name"]
-        if cfg["name"] == "cosmos25":
-            from .schedulers.scheduler_flow_unipc import FlowUniPCScheduler
-            scheduler_cfg = dict(cfg.get("video_scheduler", {}))
-            model.train_video_scheduler = FlowUniPCScheduler(
-                video_num_train_timesteps,
-                float(scheduler_cfg.get("train_shift", video_train_shift)),
-                use_karras_sigmas=False,
-                time_distribution=str(scheduler_cfg.get("time_distribution", "logitnormal")),
-                training_weight_method=str(scheduler_cfg.get("training_weight", "uniform")),
+        from .schedulers.factory import build_video_schedulers
+
+        model.train_video_scheduler, model.infer_video_scheduler = (
+            build_video_schedulers(
+                family=components.dit.scheduler_family,
+                config=cfg.get("video_scheduler"),
+                num_train_timesteps=video_num_train_timesteps,
+                train_shift=video_train_shift,
+                infer_shift=video_infer_shift,
             )
-            model.infer_video_scheduler = FlowUniPCScheduler(
-                video_num_train_timesteps,
-                float(scheduler_cfg.get("infer_shift", video_infer_shift)),
-                use_karras_sigmas=bool(scheduler_cfg.get("use_karras_sigmas", True)),
-            )
-            model.train_scheduler = model.train_video_scheduler
-            model.infer_scheduler = model.infer_video_scheduler
+        )
+        model.train_scheduler = model.train_video_scheduler
+        model.infer_scheduler = model.infer_video_scheduler
         model.model_paths = {
             "video_dit": components.dit_path,
             "vae": components.vae_path,
             "text_encoder": components.text_encoder_path,
             "tokenizer": components.tokenizer_path,
             "action_dit_backbone": action_dit_pretrained_path,
-        }
-        return model
-
-    @classmethod
-    def from_wan22_pretrained(
-        cls,
-        device: str = "cuda",
-        torch_dtype: torch.dtype = torch.bfloat16,
-        model_id: str = "./checkpoints/Wan2.2-TI2V-5B",
-        tokenizer_model_id: str = "./checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl",
-        tokenizer_max_len: int = 512,
-        load_text_encoder: bool = True,
-        video_dit_config: dict[str, Any] | None = None,
-        action_dit_config: dict[str, Any] | None = None,
-        action_dit_pretrained_path: str | None = None,
-        action_dim: int | None = None,
-        state_dim: int | None = None,
-        state_position: str = "context",
-        projector_hidden_dim: int = 64,
-        video_hidden_layer: int = 17,
-        detach_video_hidden: bool = True,
-        skip_dit_load_from_pretrain: bool = False,
-        video_train_shift: float = 5.0,
-        video_infer_shift: float = 5.0,
-        video_num_train_timesteps: int = 1000,
-        action_train_shift: float = 5.0,
-        action_infer_shift: float = 5.0,
-        action_num_train_timesteps: int = 1000,
-        loss_lambda_video: float = 1.0,
-        loss_lambda_action: float = 1.0,
-    ) -> "EasyWAMHidden":
-        if video_dit_config is None or action_dit_config is None:
-            raise ValueError(
-                "`video_dit_config` and `action_dit_config` are required for EasyWAM-Hidden."
-            )
-        if action_dim is None or state_dim is None:
-            raise ValueError("`action_dim` and `state_dim` are required for EasyWAM-Hidden.")
-        action_dit_config = dict(action_dit_config)
-        configured_action_dim = int(action_dit_config.get("action_dim", action_dim))
-        if configured_action_dim != int(action_dim):
-            raise ValueError(
-                "`action_dit_config.action_dim` must match `action_dim`: "
-                f"{configured_action_dim} != {action_dim}."
-            )
-        action_dit_config["action_dim"] = int(action_dim)
-
-        components = load_wan22_ti2v_5b_components(
-            device=device,
-            torch_dtype=torch_dtype,
-            model_id=model_id,
-            tokenizer_model_id=tokenizer_model_id,
-            tokenizer_max_len=tokenizer_max_len,
-            dit_config=video_dit_config,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
-            load_text_encoder=load_text_encoder,
-        )
-        action_dit = ActionDiT.from_pretrained(
-            action_dit_config=action_dit_config,
-            action_dit_pretrained_path=action_dit_pretrained_path,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
-            device=device,
-            torch_dtype=torch_dtype,
-        )
-        model = cls(
-            video_dit=components.dit,
-            action_dit=action_dit,
-            vae=components.vae,
-            text_encoder=components.text_encoder,
-            tokenizer=components.tokenizer,
-            text_dim=int(video_dit_config["text_dim"]),
-            state_dim=int(state_dim),
-            state_position=state_position,
-            projector_hidden_dim=int(projector_hidden_dim),
-            video_hidden_layer=int(video_hidden_layer),
-            detach_video_hidden=bool(detach_video_hidden),
-            device=device,
-            torch_dtype=torch_dtype,
-            video_train_shift=video_train_shift,
-            video_infer_shift=video_infer_shift,
-            video_num_train_timesteps=video_num_train_timesteps,
-            action_train_shift=action_train_shift,
-            action_infer_shift=action_infer_shift,
-            action_num_train_timesteps=action_num_train_timesteps,
-            loss_lambda_video=loss_lambda_video,
-            loss_lambda_action=loss_lambda_action,
-        )
-        model.model_paths = {
-            "video_dit": components.dit_path,
-            "vae": components.vae_path,
-            "text_encoder": components.text_encoder_path,
-            "tokenizer": components.tokenizer_path,
-            "action_dit_backbone": (
-                "SKIPPED_PRETRAIN"
-                if skip_dit_load_from_pretrain
-                else action_dit_pretrained_path
-            ),
         }
         return model
 
@@ -593,10 +515,10 @@ class EasyWAMHidden(nn.Module):
             )
         if self.tokenizer is None:
             context, mask = self.text_encoder(prompt)
-            return context.to(device=self.device), mask.to(device=self.device, dtype=torch.bool)
-        ids, mask = self.tokenizer(
-            prompt, return_mask=True, add_special_tokens=True
-        )
+            return context.to(device=self.device), mask.to(
+                device=self.device, dtype=torch.bool
+            )
+        ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
@@ -607,6 +529,8 @@ class EasyWAMHidden(nn.Module):
         self,
         video_tensor,
     ):
+        if endpoint.enabled(self):
+            return endpoint.encode_video(self, video_tensor)
         return self.vae.encode(video_tensor, device=self.device)
 
     @torch.no_grad()
@@ -620,6 +544,8 @@ class EasyWAMHidden(nn.Module):
         self,
         latents,
     ):
+        if endpoint.enabled(self):
+            return endpoint.decode_latents(self, latents)
         return decode_video_batch(self.vae, latents, self.device)
 
     def build_inputs(self, sample):
@@ -637,17 +563,11 @@ class EasyWAMHidden(nn.Module):
         if state is None:
             raise ValueError("EasyWAM-Hidden training requires `proprio` as state.")
         if video.ndim != 5 or video.shape[1] != 3:
-            raise ValueError(
-                f"`video` must be [B,3,T,H,W], got {tuple(video.shape)}"
-            )
+            raise ValueError(f"`video` must be [B,3,T,H,W], got {tuple(video.shape)}")
         if action.ndim != 3:
-            raise ValueError(
-                f"`action` must be [B,T,D], got {tuple(action.shape)}"
-            )
+            raise ValueError(f"`action` must be [B,T,D], got {tuple(action.shape)}")
         if state.ndim != 3:
-            raise ValueError(
-                f"`proprio` must be [B,T,D], got {tuple(state.shape)}"
-            )
+            raise ValueError(f"`proprio` must be [B,T,D], got {tuple(state.shape)}")
 
         batch_size, _, num_frames, height, width = video.shape
         if height % 16 != 0 or width % 16 != 0:
@@ -742,36 +662,16 @@ class EasyWAMHidden(nn.Module):
         context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        use_prompt = prompt is not None
-        use_context = context is not None or context_mask is not None
-        if use_prompt and use_context:
-            raise ValueError(
-                "`prompt` and `context/context_mask` are mutually exclusive."
-            )
-        if not use_prompt and not use_context:
-            raise ValueError(
-                "Either `prompt` or both `context/context_mask` must be provided."
-            )
-        if use_prompt:
+        if prompt is not None:
             return self.encode_prompt(prompt)
-        if context is None or context_mask is None:
-            raise ValueError(
-                "`context` and `context_mask` must be both provided together."
-            )
-        if context.ndim == 2:
-            context = context.unsqueeze(0)
-        if context_mask.ndim == 1:
-            context_mask = context_mask.unsqueeze(0)
         return (
-            context.to(
-                device=self.device, dtype=self.torch_dtype, non_blocking=True
-            ),
-            context_mask.to(
-                device=self.device, dtype=torch.bool, non_blocking=True
-            ),
+            context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True),
+            context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True),
         )
 
     def training_loss(self, sample):
+        if endpoint.enabled(self):
+            return endpoint.training_loss(self, sample)
         inputs = self.build_inputs(sample)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -814,7 +714,7 @@ class EasyWAMHidden(nn.Module):
             context=inputs["context"],
             context_mask=inputs["context_mask"],
             fuse_vae_embedding_in_latents=bool(
-                getattr(self.video_dit, "fuse_vae_embedding_in_latents", False)
+                self.video_dit.fuse_vae_embedding_in_latents
             ),
             image_is_pad=inputs["image_is_pad"],
             temporal_downsample_factor=int(self.vae.temporal_downsample_factor),
@@ -848,7 +748,9 @@ class EasyWAMHidden(nn.Module):
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
 
-        loss_total = self.loss_lambda_action * loss_action + self.loss_lambda_video * loss_video
+        loss_total = (
+            self.loss_lambda_action * loss_action + self.loss_lambda_video * loss_video
+        )
         return loss_total, {
             "loss_video": loss_video.detach(),
             "loss_action": loss_action.detach(),
@@ -859,7 +761,7 @@ class EasyWAMHidden(nn.Module):
     def _prepare_inference_inputs(
         self,
         *,
-        prompt: Optional[Union[str, Sequence[str]]],
+        prompt: Optional[Sequence[str]],
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
@@ -869,24 +771,18 @@ class EasyWAMHidden(nn.Module):
         seed: Optional[Union[int, Sequence[Optional[int]]]],
         rand_device: str,
     ) -> dict[str, torch.Tensor]:
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[1] != 3:
-            raise ValueError(
-                "`input_image` must be [B,3,H,W] or [3,H,W], "
-                f"got {tuple(input_image.shape)}"
-            )
+        validate_batch_inputs(input_image, prompt, context, context_mask)
         batch_size = int(input_image.shape[0])
         if proprio is None:
             raise ValueError("EasyWAM-Hidden inference requires `proprio` as state.")
-        if proprio.ndim == 1:
-            proprio = proprio.view(1, 1, -1)
-        elif proprio.ndim == 2:
-            if proprio.shape[0] == batch_size:
-                proprio = proprio.unsqueeze(1)
-            elif batch_size == 1:
-                proprio = proprio.unsqueeze(0)
-        if proprio.ndim != 3 or proprio.shape[0] != batch_size or proprio.shape[-1] != self.state_dim:
+        if proprio.ndim == 2:
+            proprio = proprio.unsqueeze(1)
+        if (
+            proprio.ndim != 3
+            or proprio.shape[0] != batch_size
+            or proprio.shape[1] == 0
+            or proprio.shape[-1] != self.state_dim
+        ):
             raise ValueError(
                 f"`proprio` must end in state_dim={self.state_dim}, got {tuple(proprio.shape)}"
             )
@@ -908,33 +804,35 @@ class EasyWAMHidden(nn.Module):
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
         latents_video = randn_per_sample(
-            (self.vae.model.z_dim, latent_t, latent_h, latent_w), seeds=seed,
-            batch_size=batch_size, rand_device=rand_device,
+            (self.vae.model.z_dim, latent_t, latent_h, latent_w),
+            seeds=seed,
+            batch_size=batch_size,
+            rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
         latents_action = randn_per_sample(
-            (action_horizon, self.action_dim), seeds=seed,
-            batch_size=batch_size, rand_device=rand_device,
+            (action_horizon, self.action_dim),
+            seeds=seed,
+            batch_size=batch_size,
+            rand_device=rand_device,
         ).to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(
             input_image=input_image.to(device=self.device, dtype=self.torch_dtype),
         )
         latents_video[:, :, 0:1] = first_frame_latents
         context, context_mask = self._prepare_context(prompt, context, context_mask)
-        if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
-            raise ValueError("Context batch size must match input_image batch size.")
         return {
             "latents_video": latents_video,
             "latents_action": latents_action,
             "first_frame_latents": first_frame_latents,
             "state": proprio[:, 0:1].to(device=self.device, dtype=self.torch_dtype),
             "context": context,
-            "context_mask": context_mask,
+            "context_mask": prepare_key_padding_mask(context_mask),
         }
 
     @torch.inference_mode()
     def infer_action_batch(
         self,
-        prompt: Optional[Union[str, Sequence[str]]],
+        prompt: Optional[Sequence[str]],
         input_image: torch.Tensor,
         action_horizon: int,
         proprio: Optional[torch.Tensor] = None,
@@ -948,7 +846,14 @@ class EasyWAMHidden(nn.Module):
         seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
         **kwargs,
-    ) -> dict[str, Any]:
+    ) -> ActionBatchResult:
+        if endpoint.enabled(self):
+            return endpoint.infer(
+                self,
+                action_only=True,
+                **{k: v for k, v in locals().items() if k not in {"self", "kwargs"}},
+                **kwargs,
+            )
         del negative_prompt, text_cfg_scale, kwargs
         self.eval()
         inputs = self._prepare_inference_inputs(
@@ -968,15 +873,10 @@ class EasyWAMHidden(nn.Module):
             dtype=inputs["latents_video"].dtype,
             shift_override=sigma_shift,
         )
-        video_context = (
-            self.video_dit.project_context(inputs["context"])
-            if hasattr(self.video_dit, "project_context")
-            else inputs["context"]
-        )
+        video_context = self.video_dit.project_context(inputs["context"])
         video_cross_kv = (
             self.video_dit.build_cross_attention_kv_cache(video_context)
-            if bool(getattr(self, "inference_cross_kv_reuse", False))
-            and hasattr(self.video_dit, "build_cross_attention_kv_cache")
+            if self.inference_cross_kv_reuse
             else None
         )
         _, video_hidden, video_token_mask = self.forward_video(
@@ -985,34 +885,32 @@ class EasyWAMHidden(nn.Module):
             context=inputs["context"],
             context_mask=inputs["context_mask"],
             fuse_vae_embedding_in_latents=bool(
-                getattr(self.video_dit, "fuse_vae_embedding_in_latents", False)
+                self.video_dit.fuse_vae_embedding_in_latents
             ),
             return_prediction=False,
             projected_context=video_context,
             cross_kv_cache=video_cross_kv,
         )
 
-        action_context = None
-        if (
-            "video_context_projector" in self.dit
-            and "action_dit" in self.dit
-            and hasattr(self.action_dit, "project_context")
-        ):
-            action_context = self.action_dit.project_context(
-                self.dit["video_context_projector"](video_hidden)
-            )
+        action_context = self.action_dit.project_context(
+            self.dit["video_context_projector"](video_hidden)
+        )
         action_cross_kv = (
             self.action_dit.build_cross_attention_kv_cache(action_context)
-            if bool(getattr(self, "inference_cross_kv_reuse", False))
-            and action_context is not None
+            if self.inference_cross_kv_reuse
             else None
         )
 
-        action_timesteps, action_deltas = self.infer_action_scheduler.build_inference_schedule(
-            num_inference_steps=len(video_timesteps),
-            device=self.device,
-            dtype=inputs["latents_action"].dtype,
-            shift_override=sigma_shift,
+        prepared_condition = self._prepare_action_condition(
+            inputs["state"], action_context, video_token_mask, action_cross_kv
+        )
+        action_timesteps, action_deltas = (
+            self.infer_action_scheduler.build_inference_schedule(
+                num_inference_steps=len(video_timesteps),
+                device=self.device,
+                dtype=inputs["latents_action"].dtype,
+                shift_override=sigma_shift,
+            )
         )
         latents_action = inputs["latents_action"]
         for step_t, step_delta in zip(action_timesteps, action_deltas):
@@ -1024,18 +922,17 @@ class EasyWAMHidden(nn.Module):
                 video_token_mask=video_token_mask,
                 projected_context=action_context,
                 cross_kv_cache=action_cross_kv,
+                prepared_condition=prepared_condition,
             )
             latents_action = self.infer_action_scheduler.step(
                 pred_action, step_delta, latents_action
             )
-        return {
-            "action": latents_action.detach().to(device="cpu", dtype=torch.float32)
-        }
+        return {"action": latents_action.detach().to(device="cpu", dtype=torch.float32)}
 
     @torch.inference_mode()
     def infer_joint_batch(
         self,
-        prompt: Optional[Union[str, Sequence[str]]],
+        prompt: Optional[Sequence[str]],
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
@@ -1050,7 +947,14 @@ class EasyWAMHidden(nn.Module):
         seed: Optional[Union[int, Sequence[Optional[int]]]] = None,
         rand_device: str = "cpu",
         **kwargs,
-    ) -> dict[str, Any]:
+    ) -> JointBatchResult:
+        if endpoint.enabled(self):
+            return endpoint.infer(
+                self,
+                action_only=False,
+                **{k: v for k, v in locals().items() if k not in {"self", "kwargs"}},
+                **kwargs,
+            )
         del action, negative_prompt, text_cfg_scale, kwargs
         self.eval()
         inputs = self._prepare_inference_inputs(
@@ -1064,17 +968,21 @@ class EasyWAMHidden(nn.Module):
             seed=seed,
             rand_device=rand_device,
         )
-        video_timesteps, video_deltas = self.infer_video_scheduler.build_inference_schedule(
-            num_inference_steps=num_inference_steps,
-            device=self.device,
-            dtype=inputs["latents_video"].dtype,
-            shift_override=sigma_shift,
+        video_timesteps, video_deltas = (
+            self.infer_video_scheduler.build_inference_schedule(
+                num_inference_steps=num_inference_steps,
+                device=self.device,
+                dtype=inputs["latents_video"].dtype,
+                shift_override=sigma_shift,
+            )
         )
-        action_timesteps, action_deltas = self.infer_action_scheduler.build_inference_schedule(
-            num_inference_steps=len(video_timesteps),
-            device=self.device,
-            dtype=inputs["latents_action"].dtype,
-            shift_override=sigma_shift,
+        action_timesteps, action_deltas = (
+            self.infer_action_scheduler.build_inference_schedule(
+                num_inference_steps=len(video_timesteps),
+                device=self.device,
+                dtype=inputs["latents_action"].dtype,
+                shift_override=sigma_shift,
+            )
         )
 
         latents_video = inputs["latents_video"]
@@ -1082,13 +990,14 @@ class EasyWAMHidden(nn.Module):
         video_context = self.video_dit.project_context(inputs["context"])
         video_cross_kv = (
             self.video_dit.build_cross_attention_kv_cache(video_context)
-            if bool(getattr(self, "inference_cross_kv_reuse", False))
+            if self.inference_cross_kv_reuse
             else None
         )
         cached_hidden = None
         cached_mask = None
         action_context = None
         action_cross_kv = None
+        prepared_condition = None
         for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
             video_timesteps, video_deltas, action_timesteps, action_deltas
         ):
@@ -1098,7 +1007,7 @@ class EasyWAMHidden(nn.Module):
                 context=inputs["context"],
                 context_mask=inputs["context_mask"],
                 fuse_vae_embedding_in_latents=bool(
-                    getattr(self.video_dit, "fuse_vae_embedding_in_latents", False)
+                    self.video_dit.fuse_vae_embedding_in_latents
                 ),
                 return_prediction=True,
                 projected_context=video_context,
@@ -1110,10 +1019,13 @@ class EasyWAMHidden(nn.Module):
                 action_context = self.action_dit.project_context(
                     self.dit["video_context_projector"](cached_hidden)
                 )
-                if bool(getattr(self, "inference_cross_kv_reuse", False)):
+                if self.inference_cross_kv_reuse:
                     action_cross_kv = self.action_dit.build_cross_attention_kv_cache(
                         action_context
                     )
+                prepared_condition = self._prepare_action_condition(
+                    inputs["state"], action_context, cached_mask, action_cross_kv
+                )
             pred_action = self.forward_action(
                 action=latents_action,
                 timestep=step_t_action.expand(latents_action.shape[0]),
@@ -1122,6 +1034,7 @@ class EasyWAMHidden(nn.Module):
                 video_token_mask=cached_mask,
                 projected_context=action_context,
                 cross_kv_cache=action_cross_kv,
+                prepared_condition=prepared_condition,
             )
             if pred_video is None:
                 raise RuntimeError("Joint inference requires a video prediction.")
@@ -1140,17 +1053,88 @@ class EasyWAMHidden(nn.Module):
         }
 
     @torch.inference_mode()
-    def infer_action(self, *args, **kwargs) -> dict[str, Any]:
-        validate_single_inference_image(args, kwargs)
-        result = self.infer_action_batch(*args, **kwargs)
+    def infer_action(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        num_video_frames: int = 5,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        **kwargs,
+    ) -> ActionInferenceResult:
+        input_image = batch_single_tensor(input_image, 3, "input_image")
+        proprio = batch_single_state(proprio, history=True)
+        context = batch_single_tensor(context, 2, "context")
+        context_mask = batch_single_tensor(context_mask, 1, "context_mask")
+        result = self.infer_action_batch(
+            prompt=[prompt] if prompt is not None else None,
+            input_image=input_image,
+            action_horizon=action_horizon,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            num_video_frames=num_video_frames,
+            negative_prompt=negative_prompt,
+            text_cfg_scale=text_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            seed=seed,
+            rand_device=rand_device,
+            **kwargs,
+        )
         return {"action": result["action"][0]}
 
     @torch.inference_mode()
-    def infer_joint(self, *args, **kwargs) -> dict[str, Any]:
-        validate_single_inference_image(args, kwargs)
-        result = self.infer_joint_batch(*args, **kwargs)
+    def infer_joint(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        num_video_frames: int,
+        action_horizon: int,
+        action: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        **kwargs,
+    ) -> JointInferenceResult:
+        input_image = batch_single_tensor(input_image, 3, "input_image")
+        proprio = batch_single_state(proprio, history=True)
+        context = batch_single_tensor(context, 2, "context")
+        context_mask = batch_single_tensor(context_mask, 1, "context_mask")
+        action = batch_single_tensor(action, 2, "action")
+        result = self.infer_joint_batch(
+            prompt=[prompt] if prompt is not None else None,
+            input_image=input_image,
+            num_video_frames=num_video_frames,
+            action_horizon=action_horizon,
+            action=action,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            negative_prompt=negative_prompt,
+            text_cfg_scale=text_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            seed=seed,
+            rand_device=rand_device,
+            **kwargs,
+        )
         result["action"] = result["action"][0]
-        if result["video"] and isinstance(result["video"][0], list):
+        if "video" in result:
             result["video"] = result["video"][0]
         return result
 
@@ -1172,10 +1156,12 @@ class EasyWAMHidden(nn.Module):
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
         rand_device: str = "cpu",
-    ) -> dict[str, Any]:
+    ) -> JointInferenceResult:
         del action_cfg_scale
         if action_horizon is None:
-            raise ValueError("`action_horizon` is required for EasyWAM-Hidden inference.")
+            raise ValueError(
+                "`action_horizon` is required for EasyWAM-Hidden inference."
+            )
         return self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -1209,6 +1195,9 @@ class EasyWAMHidden(nn.Module):
                 "backbone_name": self.backbone_name,
             }
         payload["state_position"] = self.state_position
+        payload["action_config"] = policy_action_config(self)
+        if endpoint.enabled(self):
+            payload["structure"] = endpoint.structure(self)
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1222,8 +1211,14 @@ class EasyWAMHidden(nn.Module):
 
         payload = torch.load(path, map_location="cpu")
         validate_checkpoint_state_position(payload, self.state_position)
+        validate_policy_action_config(self, payload)
+        if endpoint.enabled(self):
+            endpoint.validate_structure(self, payload)
         checkpoint_backbone = payload.get("backbone_name")
-        if checkpoint_backbone is not None and checkpoint_backbone != self.backbone_name:
+        if (
+            checkpoint_backbone is not None
+            and checkpoint_backbone != self.backbone_name
+        ):
             raise ValueError(
                 f"Checkpoint backbone {checkpoint_backbone!r} does not match model backbone "
                 f"{self.backbone_name!r}."

@@ -1,18 +1,3 @@
-#!/usr/bin/env python
-
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import glob
 import importlib
 import logging
@@ -44,33 +29,20 @@ def decode_video_frames(
     timestamps: list[float],
     tolerance_s: float,
     backend: str | None = None,
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """
-    Decodes video frames using the specified backend.
-
-    Args:
-        video_path (Path): Path to the video file.
-        timestamps (list[float]): List of timestamps to extract frames.
-        tolerance_s (float): Allowed deviation in seconds for frame retrieval.
-        backend (str, optional): Backend to use for decoding. Defaults to "torchcodec" when available in the platform; otherwise, defaults to "pyav"..
-
-    Returns:
-        torch.Tensor: Decoded frames.
-
-    Currently supports torchcodec on cpu and pyav.
-    """
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
         try:
-            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, output_dtype=output_dtype)
         except Exception as err:
             warnings.warn(
                 f"torchcodec video decode failed ({type(err).__name__}: {err}); falling back to torchvision/pyav."
             )
-            return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend="pyav")
+            return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend="pyav", output_dtype=output_dtype)
     elif backend in ["pyav", "video_reader"]:
-        return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
+        return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend, output_dtype=output_dtype)
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
 
@@ -81,39 +53,20 @@ def decode_video_frames_torchvision(
     tolerance_s: float,
     backend: str = "pyav",
     log_loaded_timestamps: bool = False,
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Loads frames associated to the requested timestamps of a video
-
-    The backend can be either "pyav" (default) or "video_reader".
-    "video_reader" requires installing torchvision from source, see:
-    https://github.com/pytorch/vision/blob/main/torchvision/csrc/io/decoder/gpu/README.rst
-    (note that you need to compile against ffmpeg<4.3)
-
-    While both use cpu, "video_reader" is supposedly faster than "pyav" but requires additional setup.
-    For more info on video decoding, see `benchmark/video/README.md`
-
-    See torchvision doc for more info on these two backends:
-    https://pytorch.org/vision/0.18/index.html?highlight=backend#torchvision.set_video_backend
-
-    Note: Video benefits from inter-frame compression. Instead of storing every frame individually,
-    the encoder stores a reference frame (or a key frame) and subsequent frames as differences relative to
-    that key frame. As a consequence, to access a requested frame, we need to load the preceding key frame,
-    and all subsequent frames until reaching the requested frame. The number of key frames in a video
-    can be adjusted during encoding to take into account decoding time and video size in bytes.
-    """
     video_path = str(video_path)
 
     keyframes_only = False
     torchvision.set_video_backend(backend)
     if backend == "pyav":
-        keyframes_only = True  # pyav doesn't support accurate seek
+        keyframes_only = True
 
-    reader = torchvision.io.VideoReader(video_path, "video")
+    reader = torchvision.io.VideoReader(video_path, 'video')
 
     first_ts = min(timestamps)
     last_ts = max(timestamps)
 
-    # Seeking starts at the preceding keyframe, so earlier frames may be decoded.
     reader.seek(first_ts, keyframes_only=keyframes_only)
 
     loaded_frames = []
@@ -132,7 +85,6 @@ def decode_video_frames_torchvision(
 
     reader = None
 
-    # Use float32 for timestamp distance computation (torch.cdist doesn't support bfloat16).
     query_ts = torch.tensor(timestamps, dtype=torch.float32)
     loaded_ts = torch.tensor(loaded_ts, dtype=torch.float32)
 
@@ -157,7 +109,8 @@ def decode_video_frames_torchvision(
     if log_loaded_timestamps:
         logging.info(f"{closest_ts=}")
 
-    closest_frames = closest_frames.type(torch.float32) / 255
+    if output_dtype != torch.uint8:
+        closest_frames = closest_frames.to(output_dtype) / 255
 
     assert len(timestamps) == len(closest_frames)
     return closest_frames
@@ -169,67 +122,34 @@ def decode_video_frames_torchcodec(
     tolerance_s: float,
     device: str = "cpu",
     log_loaded_timestamps: bool = False,
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Loads frames associated with the requested timestamps of a video using torchcodec.
-
-    Note: Setting device="cuda" outside the main process, e.g. in data loader workers, will lead to CUDA initialization errors.
-
-    Note: Video benefits from inter-frame compression. Instead of storing every frame individually,
-    the encoder stores a reference frame (or a key frame) and subsequent frames as differences relative to
-    that key frame. As a consequence, to access a requested frame, we need to load the preceding key frame,
-    and all subsequent frames until reaching the requested frame. The number of key frames in a video
-    can be adjusted during encoding to take into account decoding time and video size in bytes.
-    """
-
     if importlib.util.find_spec("torchcodec"):
         from torchcodec.decoders import VideoDecoder
     else:
         raise ImportError("torchcodec is required but not available.")
 
-    decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
-    loaded_frames = []
-    loaded_ts = []
-    metadata = decoder.metadata
-    average_fps = metadata.average_fps
-
-    frame_indices = [round(ts * average_fps) for ts in timestamps]
-
+    decoder = VideoDecoder(video_path, device=device, seek_mode='approximate')
+    average_fps = decoder.metadata.average_fps
+    frame_indices = list(dict.fromkeys(round(ts * average_fps) for ts in timestamps))
     frames_batch = decoder.get_frames_at(indices=frame_indices)
-
-    for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=False):
-        loaded_frames.append(frame)
-        loaded_ts.append(pts.item())
-        if log_loaded_timestamps:
-            logging.info(f"Frame loaded at timestamp={pts:.4f}")
-
-    # Use float32 for timestamp distance computation (torch.cdist doesn't support bfloat16).
     query_ts = torch.tensor(timestamps, dtype=torch.float32)
-    loaded_ts = torch.tensor(loaded_ts, dtype=torch.float32)
-
-    dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
-    min_, argmin_ = dist.min(1)
-
-    is_within_tol = min_ < tolerance_s
-    assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
-        "It means that the closest frame that can be loaded from the video is too far away in time."
-        "This might be due to synchronization issues with timestamps during data collection."
-        "To be safe, we advise to ignore this item during training."
-        f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts}"
-        f"\nvideo: {video_path}"
+    loaded_ts = frames_batch.pts_seconds.to(dtype=torch.float32)
+    distances = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
+    minimum, nearest = distances.min(1)
+    assert (minimum < tolerance_s).all(), (
+        f"Video timestamps violate tolerance {tolerance_s}: {minimum.tolist()}; video={video_path}"
     )
-
-    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-    closest_ts = loaded_ts[argmin_]
-
+    if len(timestamps) == len(frame_indices) and torch.equal(nearest, torch.arange(len(frame_indices), device=nearest.device)):
+        closest_frames = frames_batch.data
+    else:
+        closest_frames = frames_batch.data.index_select(0, nearest.to(frames_batch.data.device))
     if log_loaded_timestamps:
-        logging.info(f"{closest_ts=}")
-
-    closest_frames = closest_frames.type(torch.float32) / 255
-
-    assert len(timestamps) == len(closest_frames)
+        logging.info("Loaded timestamps: %s", loaded_ts[nearest].tolist())
+    if output_dtype != torch.uint8:
+        closest_frames = closest_frames.to(output_dtype) / 255
     return closest_frames
+
 
 def encode_video_frames(
     imgs_dir: Path | str,
@@ -243,7 +163,6 @@ def encode_video_frames(
     log_level: int | None = av.logging.ERROR,
     overwrite: bool = False,
 ) -> None:
-    """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     if vcodec == "h264_nvenc" :
         return encode_video_frames_ffmpeg(
             imgs_dir, video_path, fps, pix_fmt = pix_fmt, overwrite=overwrite
@@ -370,8 +289,6 @@ def encode_video_frames_ffmpeg(
 
 @dataclass
 class VideoFrame:
-    """Hugging Face dataset feature containing a video path and timestamp."""
-
     pa_type: ClassVar[Any] = pa.struct({"path": pa.string(), "timestamp": pa.float32()})
     _type: str = field(default="VideoFrame", init=False, repr=False)
 
@@ -385,7 +302,6 @@ with warnings.catch_warnings():
         "'register_feature' is experimental and might be subject to breaking changes in the future.",
         category=UserWarning,
     )
-    # to make VideoFrame available in HuggingFace `datasets`
     register_feature(VideoFrame, "VideoFrame")
 
 
@@ -455,12 +371,12 @@ def get_video_pixel_channels(pix_fmt: str) -> int:
 
 def get_image_pixel_channels(image: Image):
     if image.mode == "L":
-        return 1  # Grayscale
+        return 1
     elif image.mode == "LA":
-        return 2  # Grayscale + Alpha
+        return 2
     elif image.mode == "RGB":
-        return 3  # RGB
+        return 3
     elif image.mode == "RGBA":
-        return 4  # RGBA
+        return 4
     else:
         raise ValueError("Unknown format")

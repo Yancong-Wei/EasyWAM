@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Launch ZeRO-1 training on one GPU. Extra args are Hydra overrides.
+# Low-level ZeRO-1 launcher on one GPU. Extra args are Hydra overrides.
+# For the A800 CPU-offload baseline, prefer scripts/robodojo_pipeline.py.
 # Example:
-#   bash scripts/train_single_gpu.sh task=libero_easywam_mot_wan22_lora_48g
+#   bash scripts/train_single_gpu.sh task=robodojo_easywam_mot_wan22_a800
 set -euo pipefail
 
 unset OMP_NUM_THREADS || true

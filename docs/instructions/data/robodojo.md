@@ -34,7 +34,7 @@ Precompute the RoboDojo Wan2.2 text cache. Each prompt is stored in a SHA-256-na
 python scripts/precompute_text_embeds.py task=robodojo_easywam_mot_wan22
 ```
 
-The five Wan2.2 recipes are `mot`, `hidden`, `unified`, `mot_joint`, and `mot_idm`, named `robodojo_easywam_<architecture>_wan22`. Their training values match the RoboTwin recipes. Launch training by passing the task as a Hydra override:
+The five Wan2.2 recipes are `mot`, `hidden`, `unified`, `mot_joint`, and `mot_idm`, named `robodojo_easywam_<architecture>_wan22`. The base recipes retain their upstream optimizer settings; the A800 recipe changes execution and batch settings. Launch training by passing the task as a Hydra override:
 
 ```bash
 NPROC_PER_NODE=8 bash scripts/train_zero1.sh \

@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional, List
+from collections.abc import Mapping
 
 import torch
 import numpy as np
@@ -11,6 +12,11 @@ from .base_processor import BaseProcessor
 logger = get_logger(__name__)
 
 class WAMProcessor(BaseProcessor):
+    def camera_views(
+        self, pixel_values: torch.Tensor | list[torch.Tensor]
+    ) -> tuple[torch.Tensor, ...] | list[torch.Tensor]:
+        return pixel_values.unbind(0) if self.stack_images else pixel_values
+
     def __init__(
         self,
         shape_meta: Dict[str, Any],
@@ -35,7 +41,11 @@ class WAMProcessor(BaseProcessor):
 
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
+        stack_images: bool = True,
+        include_gt_action: bool = True,
     ):
+        self.stack_images = bool(stack_images)
+        self.include_gt_action = bool(include_gt_action)
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
         self.num_output_cameras = num_output_cameras
@@ -45,8 +55,15 @@ class WAMProcessor(BaseProcessor):
         self.drop_high_level_prob = drop_high_level_prob
         self.use_zh_instruction = use_zh_instruction
 
-        self.train_transforms = train_transforms
-        self.val_transforms = val_transforms
+        image_keys = [meta["key"] for meta in shape_meta["images"]]
+        self.train_transforms = (
+            dict(train_transforms) if isinstance(train_transforms, Mapping)
+            else dict.fromkeys(image_keys, train_transforms)
+        )
+        self.val_transforms = (
+            dict(val_transforms) if isinstance(val_transforms, Mapping)
+            else dict.fromkeys(image_keys, val_transforms)
+        )
 
         self._is_train = None
 
@@ -111,7 +128,7 @@ class WAMProcessor(BaseProcessor):
             stats=dataset_stats,
         )
 
-    def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:
+    def augment_instruction(self, data: Dict[str, str]) -> str:
         """Choose the instruction language and optional high-level task."""
         if "coarse_task" in data:
             high_level_instruction = data["coarse_task"]
@@ -167,7 +184,6 @@ class WAMProcessor(BaseProcessor):
         return batch
 
     def preprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform a dataset sample into the tensors consumed by WAM."""
         sample = {}
         sample["instruction"] = self.augment_instruction(data)
         sample["image_is_pad"] = data["image_is_pad"]
@@ -185,8 +201,7 @@ class WAMProcessor(BaseProcessor):
             assert image.ndim == 4, f"Expected 4 dimensions (num_image_steps, C, H, W), got shape {image.shape}"
             
             transforms = self.train_transforms if self.is_train else self.val_transforms
-            current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
-            for trans in current_transforms:
+            for trans in transforms[key]:
                 image = trans(image)
             
             meta_shape = [num_image_steps] + shape
@@ -194,21 +209,14 @@ class WAMProcessor(BaseProcessor):
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)
-        pixel_values = torch.stack(processed_images, dim=0)
-        
-        if self.num_output_cameras > pixel_values.shape[0]:
-            out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
-            out[0: pixel_values.shape[0]] = pixel_values
-            sample["pixel_values"] = out
-        elif self.num_output_cameras < pixel_values.shape[0]:
-            logger.warning(f"num_output_cameras {self.num_output_cameras} is less than the number of cameras in data {pixel_values.shape[0]}, "
-                           f"truncating the input to the first {self.num_output_cameras} cameras.")
-            sample["pixel_values"] = pixel_values[:self.num_output_cameras]
-        else:
-            sample["pixel_values"] = pixel_values
+        if self.num_output_cameras != len(processed_images):
+            if self.num_output_cameras < len(processed_images):
+                processed_images = processed_images[:self.num_output_cameras]
+            else:
+                processed_images.extend(torch.zeros_like(processed_images[0]) for _ in range(self.num_output_cameras - len(processed_images)))
+        sample["pixel_values"] = torch.stack(processed_images, dim=0) if self.stack_images else processed_images
 
-        # Keep ground-truth actions for open-loop evaluation.
-        if not self.is_train and "action" in data:
+        if self.include_gt_action and not self.is_train and "action" in data:
             sample["gt_action"] = deepcopy(data["action"])
 
         if "action" in data and self.delta_action_dim_mask is not None:
@@ -238,7 +246,6 @@ class WAMProcessor(BaseProcessor):
         return sample
 
     def postprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Undo action transforms and normalization for policy output."""
         assert "action" in data, "Action is required in postprocess"
         data["state"] = data.pop("proprio")
         data = self.action_state_merger.backward(data)

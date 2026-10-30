@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "easywam"
 version = "0.1.0"
-description = "EasyWAM: An Efficient and Easy-to-Use Codebase for World Action Model"
+description = "EasyWAM RoboDojo development core for world action models"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate==1.5.2",
@@ -14,18 +14,15 @@ dependencies = [
   "datasets==3.6.0",
   "deepspeed==0.16.9",
   "einops==0.8.1",
+  "ftfy==6.3.1",
   "gitpython==3.1.45",
   "huggingface-hub==0.36.2",
   "hydra-core==1.3.2",
-  "h5py==3.16.0",
   "imageio==2.37.0",
   "imageio-ffmpeg==0.6.0",
   "jsonlines==4.0.0",
-  "matplotlib==3.5.3",
-  "modelscope==1.34.0",
   "numpy==1.26.4",
   "omegaconf==2.3.0",
-  "opencv-python==4.6.0.66",
   "packaging==26.3",
   "pandas==2.2.3",
   "peft==0.19.1",
@@ -42,6 +39,9 @@ dependencies = [
   "typing-extensions==4.15.0",
   "wandb==0.23.1",
 ]
+
+[project.optional-dependencies]
+publish = ["modelscope==1.34.0"]
 
 [tool.setuptools]
 py-modules = ["runtime", "trainer"]

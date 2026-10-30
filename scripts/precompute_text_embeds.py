@@ -1,35 +1,31 @@
 import logging
+import json
 import os
-import re
 import uuid
 from pathlib import Path
 from typing import Any
 
 import hydra
 import torch
+import pyarrow.parquet as pq
 import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
 from data.lerobot.robot_video_dataset import DEFAULT_PROMPT
-from data.lerobot.lerobot.datasets.utils import load_info, load_tasks, load_tasks_v21
+from data.lerobot.lerobot.datasets.utils import load_info
 from data.lerobot.text_embedding_cache import (
     build_text_embedding_payload,
     prompt_hash,
     text_embedding_cache_filename,
 )
-from model.backbone.wan22.loader import _load_registered_model, _resolve_configs
-from model.backbone.wan22.wan_video_text_encoder import HuggingfaceTokenizer
+from model.backbone import load_backbone_text_encoder, normalize_backbone_config
+from utils.pytorch_utils import mixed_precision_to_dtype
 from utils.config_resolvers import register_default_resolvers
 from utils.logging_config import get_logger, setup_logging
 
 register_default_resolvers()
 logger = get_logger(__name__)
-
-DEFAULT_MODEL_ID = "./checkpoints/Wan2.2-TI2V-5B"
-DEFAULT_TOKENIZER_MODEL_ID = "./checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl"
-DEFAULT_CONTEXT_LEN = 128
-DEFAULT_BATCH_SIZE = 16
 
 
 def _init_distributed():
@@ -99,7 +95,11 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
-        logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
+        logger.info(
+            "Discovered dataset node `%s` with %d dataset_dirs.",
+            node_path,
+            len(raw_dirs),
+        )
 
     return dataset_dirs, cache_dirs, context_lens
 
@@ -121,22 +121,47 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     for ds_dir in dataset_dirs:
         root = Path(ds_dir)
         version = str(load_info(root).get("codebase_version"))
-        if version == "v3.0":
-            tasks, _ = load_tasks(root)
-        elif version == "v2.1":
-            tasks, _ = load_tasks_v21(root)
-        else:
+        if version != "v3.0":
             raise ValueError(
                 f"Unsupported LeRobot dataset version {version!r} at {root}; "
-                "expected v3.0 or v2.1."
+                "expected v3.0."
             )
-
-        for task in tasks.values():
-            prompt = DEFAULT_PROMPT.format(task=str(task))
-            total_task_rows += 1
-            if prompt not in seen:
-                seen.add(prompt)
-                prompts.append(prompt)
+        table = pq.ParquetFile(root / "meta/tasks.parquet")
+        names = table.schema_arrow.names
+        if "task_index" not in names:
+            raise ValueError(f"LeRobot v3 task metadata is missing task_index: {root}")
+        metadata = json.loads((table.schema_arrow.metadata or {}).get(b"pandas", b"{}"))
+        index_columns = [
+            column
+            for column in metadata.get("index_columns", [])
+            if isinstance(column, str)
+        ]
+        if "task" in names and "task" not in index_columns:
+            task_columns = ["task"]
+        elif index_columns:
+            task_columns = index_columns
+        elif "__index_level_0__" in names:
+            task_columns = ["__index_level_0__"]
+        else:
+            raise ValueError(
+                f"Missing task text column in {root / 'meta/tasks.parquet'}"
+            )
+        task_indices = set()
+        for batch in table.iter_batches(columns=["task_index", *task_columns]):
+            columns = [batch.column(i).to_pylist() for i in range(batch.num_columns)]
+            for task_index, *labels in zip(*columns):
+                task_index = int(task_index)
+                if task_index in task_indices:
+                    raise ValueError(
+                        f"LeRobot v3 task metadata contains duplicate task indices: {root}"
+                    )
+                task_indices.add(task_index)
+                task = labels[0] if len(labels) == 1 else tuple(labels)
+                prompt = DEFAULT_PROMPT.format(task=str(task))
+                total_task_rows += 1
+                if prompt not in seen:
+                    seen.add(prompt)
+                    prompts.append(prompt)
 
     logger.info(
         "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
@@ -156,25 +181,37 @@ def _get_override_prompt(override_instruction: Any) -> str | None:
     return DEFAULT_PROMPT.format(task=task)
 
 
-def _model_id_to_enc_id(model_id: str) -> str:
-    base = str(model_id).split("/")[-1]
-    enc_id = re.sub(r"[^a-z0-9]+", "", base.lower())
-    return enc_id or "textenc"
-
-
-def _atomic_torch_save(payload: dict[str, Any], output_path: Path):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def _atomic_torch_save(
+    payload: dict[str, Any], output_path: Path, *, ensure_parent: bool = True
+):
+    if ensure_parent:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.parent / f".{output_path.name}.tmp.{uuid.uuid4().hex}"
     torch.save(payload, str(tmp_path))
     os.replace(tmp_path, output_path)
 
 
-def _cache_filename(prompt_digest: str, context_len: int, encoder_id: str) -> str:
-    if encoder_id == "qwen3_flux2":
-        return f"{prompt_digest}.qwen3_flux2_len{context_len}.pt"
+def _cache_filename(
+    prompt_digest: str,
+    context_len: int,
+    encoder_id: str,
+    dtype: torch.dtype | None = None,
+) -> str:
     return text_embedding_cache_filename(
-        prompt_digest, context_len, encoder_id, is_hash=True
+        prompt_digest, context_len, encoder_id, is_hash=True, dtype=dtype
     )
+
+
+def _iter_embedding_rows(
+    context: torch.Tensor, mask: torch.Tensor, *, dtype: torch.dtype | None = None
+):
+    context = context.detach().to(device="cpu", dtype=dtype)
+    mask = mask.detach().to(device="cpu", dtype=torch.bool)
+    for i in range(context.shape[0]):
+        yield (
+            context[i].clone(memory_format=torch.contiguous_format),
+            mask[i].clone(memory_format=torch.contiguous_format),
+        )
 
 
 def _cache_payload(
@@ -184,11 +221,6 @@ def _cache_payload(
     encoder_id: str,
     prompt_digest: str,
 ) -> dict[str, Any]:
-    if encoder_id == "qwen3_flux2":
-        return {
-            "text_hidden_states": context,
-            "text_attention_mask": mask,
-        }
     return build_text_embedding_payload(
         context=context,
         mask=mask,
@@ -205,13 +237,17 @@ def main(cfg: DictConfig):
     is_distributed, rank, world_size, local_rank = _init_distributed()
     if is_distributed and rank == 0:
         logger.info("Distributed enabled: world_size=%d", world_size)
-    if (not is_distributed) and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    if (
+        (not is_distributed)
+        and torch.cuda.is_available()
+        and torch.cuda.device_count() > 1
+    ):
         logger.info(
             "Multi-GPU available. To use it, run: torchrun --standalone --nproc_per_node=%d scripts/precompute_text_embeds.py",
             torch.cuda.device_count(),
         )
 
-    overwrite = _to_bool(cfg.get("overwrite", True))
+    overwrite = _to_bool(cfg.get("overwrite", False))
     model_cfg = cfg.model
     if model_cfg is None:
         raise ValueError("`cfg.model` is required.")
@@ -226,7 +262,9 @@ def main(cfg: DictConfig):
     override_prompt = _get_override_prompt(cfg.get("override_instruction"))
     if override_prompt is not None:
         prompts = [override_prompt]
-        logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
+        logger.info(
+            "Using override_instruction; skipping dataset scan and encoding exactly 1 prompt."
+        )
     else:
         if not dataset_dirs:
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
@@ -239,98 +277,16 @@ def main(cfg: DictConfig):
         device = f"cuda:{local_rank}" if is_distributed else "cuda"
     else:
         device = "cpu"
-    torch_dtype = torch.bfloat16
+    torch_dtype = mixed_precision_to_dtype(cfg.mixed_precision)
     backbone_cfg = model_cfg.get("backbone")
     if backbone_cfg is None:
         raise ValueError("`cfg.model.backbone` is required.")
-    backbone_name = str(backbone_cfg.get("name", "")).lower()
-    model_id = str(backbone_cfg.get("model_id", DEFAULT_MODEL_ID))
-    enc_id = str(backbone_cfg.get("text_encoder_id", _model_id_to_enc_id(model_id)))
-
-    if backbone_name == "wan22":
-        text_encoder_model_id = model_id
-        tokenizer_model_id = str(
-            backbone_cfg.get("tokenizer_model_id", DEFAULT_TOKENIZER_MODEL_ID)
+    backbone_cfg = normalize_backbone_config(backbone_cfg)
+    enc_id = str(backbone_cfg["text_encoder_id"])
+    if not enc_id.strip():
+        raise ValueError(
+            "`text_encoder_id` must be provided by the model configuration."
         )
-    elif backbone_name == "cosmos25":
-        reason_model_id = backbone_cfg.get("reason_model_id")
-        if not reason_model_id:
-            raise ValueError("Cosmos25 text caching requires `reason_model_id`.")
-        # Cosmos-Reason bundles the matching tokenizer with the text encoder.
-        text_encoder_model_id = str(reason_model_id)
-        tokenizer_model_id = str(reason_model_id)
-    elif backbone_name == "flux2":
-        text_encoder_model_id = str(backbone_cfg.qwen3_model_spec)
-        tokenizer_model_id = text_encoder_model_id
-        if enc_id != "qwen3_flux2":
-            raise ValueError("FLUX.2 text cache requires text_encoder_id=qwen3_flux2.")
-    else:
-        raise ValueError(f"Unsupported backbone for text caching: {backbone_name!r}")
-
-    logger.info(
-        "Preparing text encoder for backbone=%s with text_encoder_model_id=%s "
-        "tokenizer_model_id=%s device=%s dtype=%s context_len=%d overwrite=%s",
-        backbone_name,
-        text_encoder_model_id,
-        tokenizer_model_id,
-        device,
-        torch_dtype,
-        context_len,
-        overwrite,
-    )
-
-    tokenizer = None
-    if backbone_name == "wan22":
-        _, text_config, _, tokenizer_config = _resolve_configs(
-            model_id=model_id,
-            tokenizer_model_id=tokenizer_model_id,
-        )
-        text_config.resolve()
-        tokenizer_config.resolve()
-        text_encoder = _load_registered_model(
-            text_config.path,
-            "wan_video_text_encoder",
-            torch_dtype=torch_dtype,
-            device=device,
-        ).eval()
-        tokenizer = HuggingfaceTokenizer(
-            name=tokenizer_config.path,
-            seq_len=context_len,
-            clean="whitespace",
-        )
-    elif backbone_name == "cosmos25":
-        from model.backbone.cosmos25.cosmos_video_text_encoder import Cosmos25TextEncoder
-        from model.backbone.cosmos25.loader import (
-            load_cosmos25_text_projection,
-            resolve_cosmos25_dit_path,
-        )
-
-        text_encoder = Cosmos25TextEncoder.from_pretrained(
-            text_encoder_model_id, torch_dtype=torch_dtype, max_length=context_len
-        ).to(device).eval()
-        projection = load_cosmos25_text_projection(
-            resolve_cosmos25_dit_path(model_id),
-            device=device,
-            torch_dtype=torch_dtype,
-        )
-        text_encoder.set_projector(projection)
-    elif backbone_name == "flux2":
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        from model.backbone.flux2.text_encoder import Flux2Qwen3TextEncoder
-
-        qwen_tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_id)
-        qwen = AutoModelForCausalLM.from_pretrained(
-            text_encoder_model_id,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-        ).eval().requires_grad_(False).to(device)
-        text_encoder = Flux2Qwen3TextEncoder(
-            qwen,
-            qwen_tokenizer,
-            output_layers=backbone_cfg.qwen3_output_layers,
-            max_length=context_len,
-        ).eval()
 
     stats = {
         str(cache_dir): {"new": 0, "overwrite": 0, "skip": 0}
@@ -342,7 +298,7 @@ def main(cfg: DictConfig):
         prompts_to_encode: list[str] = []
         for prompt in local_prompts:
             hashed = prompt_hash(prompt)
-            filename = _cache_filename(hashed, context_len, enc_id)
+            filename = _cache_filename(hashed, context_len, enc_id, torch_dtype)
             if all((cache_dir / filename).is_file() for cache_dir in cache_dirs):
                 fully_cached_local += 1
                 for cache_dir in cache_dirs:
@@ -355,7 +311,9 @@ def main(cfg: DictConfig):
     prompts_encoded_global = prompts_encoded_local
     fully_cached_global = fully_cached_local
     if is_distributed:
-        reduce_device = torch.device(device) if device.startswith("cuda") else torch.device("cpu")
+        reduce_device = (
+            torch.device(device) if device.startswith("cuda") else torch.device("cpu")
+        )
         count_tensor = torch.tensor(
             [prompts_encoded_local, fully_cached_local],
             device=reduce_device,
@@ -373,67 +331,98 @@ def main(cfg: DictConfig):
             overwrite,
         )
 
+    if prompts_encoded_global == 0:
+        logger.info(
+            "All required text embeddings are cached; skipping text encoder initialization."
+        )
+        if is_distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
+    logger.info(
+        "Preparing text encoder: encoder_id=%s device=%s dtype=%s context_len=%d overwrite=%s",
+        enc_id,
+        device,
+        torch_dtype,
+        context_len,
+        overwrite,
+    )
+    for cache_dir in cache_dirs:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    encoder = load_backbone_text_encoder(
+        backbone_cfg,
+        device=device,
+        torch_dtype=torch_dtype,
+        context_len=context_len,
+    )
+
     over_length_prompts = 0
     with tqdm(
         total=len(local_prompts),
-        desc=f"Encoding prompts (rank {rank}/{world_size})" if is_distributed else "Encoding prompts",
+        desc=(
+            f"Encoding prompts (rank {rank}/{world_size})"
+            if is_distributed
+            else "Encoding prompts"
+        ),
         unit="prompt",
         dynamic_ncols=True,
         disable=is_distributed and rank != 0,
     ) as pbar:
         with torch.no_grad():
-            encode_batch_size = 1 if backbone_name in {"cosmos25", "flux2"} else DEFAULT_BATCH_SIZE
+            encode_batch_size = encoder.batch_size
             for start in range(0, len(local_prompts), encode_batch_size):
                 batch_prompts = local_prompts[start : start + encode_batch_size]
-                if tokenizer is None:
-                    if backbone_name == "cosmos25":
-                        context, mask, token_mask = text_encoder(
-                            batch_prompts, return_token_mask=True
-                        )
-                    else:
-                        context, mask = text_encoder(batch_prompts)
-                        token_mask = mask
-                    mask = mask.to(device=device, dtype=torch.bool)
-                else:
-                    ids, mask = tokenizer(batch_prompts, return_mask=True, add_special_tokens=True)
-                    ids = ids.to(device)
-                    mask = mask.to(device=device, dtype=torch.bool)
-                    context = text_encoder(ids, mask)
-                    token_mask = mask
+                encoded = encoder.encode_batch(batch_prompts)
+                context, mask, token_mask = (
+                    encoded.context,
+                    encoded.mask,
+                    encoded.token_mask,
+                )
                 over_length_prompts += int(token_mask.all(dim=1).sum().item())
 
-                for i, prompt in enumerate(batch_prompts):
+                for prompt, (context_i, mask_i) in zip(
+                    batch_prompts,
+                    _iter_embedding_rows(context, mask, dtype=torch_dtype),
+                ):
                     hashed = prompt_hash(prompt)
-                    context_i = context[i].detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
-                    mask_i = mask[i].detach().to(device="cpu", dtype=torch.bool).contiguous()
                     context_i[~mask_i] = 0
                     payload = _cache_payload(
                         context_i, mask_i, context_len, enc_id, hashed
                     )
-                    filename = _cache_filename(hashed, context_len, enc_id)
+                    filename = _cache_filename(hashed, context_len, enc_id, torch_dtype)
                     for cache_dir in cache_dirs:
                         cache_path = cache_dir / filename
                         key = str(cache_dir)
-                        if cache_path.exists() and not overwrite:
+                        exists = cache_path.exists()
+                        if exists and not overwrite:
                             stats[key]["skip"] += 1
                             continue
-                        if cache_path.exists():
+                        if exists:
                             stats[key]["overwrite"] += 1
                         else:
                             stats[key]["new"] += 1
-                        _atomic_torch_save(payload, cache_path)
+                        _atomic_torch_save(payload, cache_path, ensure_parent=False)
 
                 pbar.update(len(batch_prompts))
 
     over_length_global = over_length_prompts
     if is_distributed:
-        reduce_device = torch.device(device) if device.startswith("cuda") else torch.device("cpu")
-        over_tensor = torch.tensor([over_length_prompts], device=reduce_device, dtype=torch.long)
+        reduce_device = (
+            torch.device(device) if device.startswith("cuda") else torch.device("cpu")
+        )
+        over_tensor = torch.tensor(
+            [over_length_prompts], device=reduce_device, dtype=torch.long
+        )
         dist.all_reduce(over_tensor, op=dist.ReduceOp.SUM)
         over_length_global = int(over_tensor.item())
         counts_tensor = torch.tensor(
             [
-                [stats[str(cache_dir)]["new"], stats[str(cache_dir)]["overwrite"], stats[str(cache_dir)]["skip"]]
+                [
+                    stats[str(cache_dir)]["new"],
+                    stats[str(cache_dir)]["overwrite"],
+                    stats[str(cache_dir)]["skip"],
+                ]
                 for cache_dir in cache_dirs
             ],
             device=reduce_device,

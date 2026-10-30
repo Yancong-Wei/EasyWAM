@@ -6,7 +6,6 @@ import torch
 
 
 TEXT_EMBEDDING_CACHE_VERSION = 3
-DEFAULT_TEXT_ENCODER_ID = "wan22ti2v5b"
 
 
 def prompt_hash(prompt: str) -> str:
@@ -19,9 +18,17 @@ def text_embedding_cache_filename(
     encoder_id: str,
     *,
     is_hash: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> str:
     hashed = prompt_or_hash if is_hash else prompt_hash(prompt_or_hash)
-    return f"{hashed}.text_len{int(context_len)}.{encoder_id}.pt"
+    suffix = {
+        None: "",
+        torch.bfloat16: "",
+        torch.float16: ".fp16",
+        torch.float32: ".fp32",
+    }[dtype]
+    stem = f"{hashed}.text_len{int(context_len)}.{encoder_id}"
+    return f"{stem}{suffix}.pt"
 
 
 def build_text_embedding_payload(
@@ -31,13 +38,14 @@ def build_text_embedding_payload(
     context_len: int,
     encoder_id: str,
     prompt_digest: str,
+    dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     payload = {
         "format_version": TEXT_EMBEDDING_CACHE_VERSION,
         "encoder_id": str(encoder_id),
         "context_len": int(context_len),
         "prompt_hash": str(prompt_digest),
-        "context": context.to(device="cpu", dtype=torch.bfloat16).contiguous(),
+        "context": context.to(device="cpu", dtype=dtype).contiguous(),
         "mask": mask.to(device="cpu", dtype=torch.bool).contiguous(),
     }
     validate_text_embedding_payload(
@@ -45,6 +53,7 @@ def build_text_embedding_payload(
         expected_context_len=context_len,
         expected_encoder_id=encoder_id,
         expected_prompt_hash=prompt_digest,
+        expected_dtype=dtype,
     )
     return payload
 
@@ -55,6 +64,7 @@ def validate_text_embedding_payload(
     expected_context_len: int,
     expected_encoder_id: str,
     expected_prompt_hash: str | None = None,
+    expected_dtype: torch.dtype | None = None,
 ) -> None:
     if not isinstance(payload, dict):
         raise TypeError(
@@ -64,18 +74,25 @@ def validate_text_embedding_payload(
     missing = required.difference(payload)
     if missing:
         raise KeyError(f"Text embedding cache is missing fields: {sorted(missing)}.")
-    if "format_version" in payload and int(payload["format_version"]) != TEXT_EMBEDDING_CACHE_VERSION:
+    if (
+        "format_version" in payload
+        and int(payload["format_version"]) != TEXT_EMBEDDING_CACHE_VERSION
+    ):
         raise ValueError(
             "Text embedding cache format version mismatch: "
             f"expected {TEXT_EMBEDDING_CACHE_VERSION}, got {payload['format_version']}. "
             "Regenerate text embeddings with overwrite=true."
         )
-    if "encoder_id" in payload and str(payload["encoder_id"]) != str(expected_encoder_id):
+    if "encoder_id" in payload and str(payload["encoder_id"]) != str(
+        expected_encoder_id
+    ):
         raise ValueError(
             "Text embedding cache encoder mismatch: "
             f"expected {expected_encoder_id}, got {payload['encoder_id']}."
         )
-    if "context_len" in payload and int(payload["context_len"]) != int(expected_context_len):
+    if "context_len" in payload and int(payload["context_len"]) != int(
+        expected_context_len
+    ):
         raise ValueError(
             "Text embedding cache context length mismatch: "
             f"expected {expected_context_len}, got {payload['context_len']}."
@@ -102,14 +119,21 @@ def validate_text_embedding_payload(
             f"`mask` must be a [L] tensor, got {type(mask)} "
             f"with shape={getattr(mask, 'shape', None)}."
         )
-    if context.shape[0] != expected_context_len or mask.shape[0] != expected_context_len:
+    if (
+        context.shape[0] != expected_context_len
+        or mask.shape[0] != expected_context_len
+    ):
         raise ValueError(
             "Text embedding cache sequence length mismatch: "
             f"context={context.shape[0]}, mask={mask.shape[0]}, "
             f"expected={expected_context_len}."
         )
-    if context.dtype != torch.bfloat16:
-        raise TypeError(f"`context` must use bfloat16, got {context.dtype}.")
+    if context.dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+        raise TypeError(f"Unsupported text embedding dtype: {context.dtype}.")
+    if expected_dtype is not None and context.dtype != expected_dtype:
+        raise TypeError(
+            f"Text embedding dtype mismatch: expected {expected_dtype}, got {context.dtype}."
+        )
     if mask.dtype != torch.bool:
         raise TypeError(f"`mask` must use bool, got {mask.dtype}.")
 
@@ -119,6 +143,8 @@ def load_text_embedding_cache(
     context_len: int,
     encoder_id: str,
     prompt_digest: str | None = None,
+    *,
+    expected_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     path = Path(cache_path)
     if not path.is_file():
@@ -132,5 +158,6 @@ def load_text_embedding_cache(
         expected_context_len=context_len,
         expected_encoder_id=encoder_id,
         expected_prompt_hash=prompt_digest,
+        expected_dtype=expected_dtype,
     )
     return payload
