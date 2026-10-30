@@ -4,6 +4,8 @@
 
 本文介绍 EasyWAM 中 RoboDojo 的训练数据准备与训练流程。
 
+下载容量检查、单卡全参数配方、短训练探测和完整评测命令见 [Wan5B/MoT 全流程](../benchmark/robodojo_pipeline_zh.md)。
+
 ## 训练数据
 
 从 [OpenMOSS-Team/robodojo-lerobot-v3.0](https://huggingface.co/datasets/OpenMOSS-Team/robodojo-lerobot-v3.0) 下载可直接使用的 LeRobot v3.0 数据集。下载位置与 `configs/data/robodojo.yaml` 中的默认路径一致：
@@ -34,7 +36,7 @@ data/robodojo-lerobot-v3.0/
 python scripts/precompute_text_embeds.py task=robodojo_easywam_mot_wan22
 ```
 
-五种 Wan2.2 配置为 `mot`、`hidden`、`unified`、`mot_joint`、`mot_idm`，命名为 `robodojo_easywam_<architecture>_wan22`。训练参数与 RoboTwin 配置相同。将 task 作为 Hydra override 启动训练：
+五种 Wan2.2 配置为 `mot`、`hidden`、`unified`、`mot_joint`、`mot_idm`，命名为 `robodojo_easywam_<architecture>_wan22`。基础配方保留上游优化器设置，A800 配方调整运行和 batch 参数。将 task 作为 Hydra override 启动训练：
 
 ```bash
 NPROC_PER_NODE=8 bash scripts/train_zero1.sh \

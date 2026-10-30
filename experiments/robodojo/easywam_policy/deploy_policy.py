@@ -509,11 +509,18 @@ def get_model(usr_args: Dict[str, Any]):
     sim_cfg_path = usr_args.get("sim_cfg_path")
     sim_cfg_name = usr_args.get("sim_cfg_name")
     sim_task = usr_args.get("sim_task")
-    cfg = _compose_sim_cfg(
-        sim_cfg_path=sim_cfg_path,
-        sim_cfg_name=sim_cfg_name,
-        sim_task=sim_task,
-    )
+    resolved_path = usr_args.get("resolved_sim_cfg_path")
+    if not _is_none_like(resolved_path):
+        cfg = OmegaConf.load(Path(str(resolved_path)).expanduser().resolve())
+        for required in ("model", "data", "EVALUATION", "MULTIRUN"):
+            if required not in cfg:
+                raise ValueError(f"Resolved evaluation config is missing {required}")
+    else:
+        cfg = _compose_sim_cfg(
+            sim_cfg_path=sim_cfg_path,
+            sim_cfg_name=sim_cfg_name,
+            sim_task=sim_task,
+        )
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):

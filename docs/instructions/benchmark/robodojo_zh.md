@@ -2,6 +2,8 @@
 
 [English](robodojo.md) | [Benchmark 索引](README_zh.md) | [数据与训练指南](../data/robodojo_zh.md) | [返回项目 README](../../../README_zh.md)
 
+单卡全参数方案见 [A800：Wan5B/MoT 下载、训练、推理与跑分](robodojo_pipeline_zh.md)，包含存储检查、短训练探测和评测结果隔离。
+
 评测器运行 RoboDojo 官方 42 个仿真任务及种子 0、1、2。12 个泛化任务每个种子分别评测标准和 `_random` 配置各 25 局；其他任务每个种子评测 50 局。
 
 ## 安装

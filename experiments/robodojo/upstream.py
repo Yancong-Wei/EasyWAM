@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POLICY_SOURCE = PROJECT_ROOT / "experiments" / "robodojo" / "easywam_policy"
 
 
-def validate_robodojo_root(root: Path) -> Path:
+def validate_robodojo_root(root: Path, *, require_policy: bool = True) -> Path:
     root = root.expanduser().resolve()
     required = (
         "scripts/eval_policy.sh",
@@ -22,8 +22,9 @@ def validate_robodojo_root(root: Path) -> Path:
         "scripts/internal/summarize_result.py",
         "src/eval_client/main.py",
         "env_cfg/arx_x5.yml",
-        "XPolicyLab/client_server/ws/model_server.py",
     )
+    if require_policy:
+        required += ("XPolicyLab/client_server/ws/model_server.py",)
     missing = [item for item in required if not (root / item).is_file()]
     if missing:
         raise FileNotFoundError(

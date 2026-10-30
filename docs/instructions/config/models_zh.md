@@ -1,5 +1,7 @@
 # 模型配置
 
+当前开发基线仅使用 Wan5B/MoT 全参数训练；下文其他模型配置属于保留的研究接口，未作为本次 RoboDojo 已验证成果。
+
 [English](models.md) | [配置索引](README_zh.md) | [返回 README](../../../README_zh.md)
 
 `configs/model/` 中的模型配置选择 EasyWAM 架构、视觉 backbone 和可选的 LoRA adapter。task 配置将模型与数据集、训练参数组合起来。模型命名形式为 `easywam_<architecture>_<backbone>[_lora]`。
@@ -17,10 +19,10 @@
 可以选择已有 task，也可以保留其数据与训练设置，覆盖模型组：
 
 ```bash
-python scripts/train.py --cfg job task=libero_easywam_mot_joint_cosmos25
+python scripts/train.py --cfg job task=robodojo_easywam_mot_joint_wan22 model=easywam_mot_joint_cosmos25
 
 python scripts/train.py --cfg job \
-  task=libero_easywam_mot_wan22 \
+  task=robodojo_easywam_mot_wan22 \
   model=easywam_hidden_wan22_lora
 ```
 
@@ -89,7 +91,7 @@ MoT 系列专家需要兼容的 block 拓扑与注意力维度。Hidden 通过�
 
 ```bash
 NPROC_PER_NODE=4 bash scripts/train_zero2.sh \
-  task=libero_easywam_mot_wan22 \
+  task=robodojo_easywam_mot_wan22 \
   model=easywam_mot_wan22_lora \
   model.lora.r=64 \
   model.lora.lora_alpha=64

@@ -1,0 +1,17 @@
+# @package _global_
+# Full Video/Action DiT fine-tuning; frozen VAE/text encoder, no LoRA.
+# Start with CPU optimizer offload on one A800 80GB; capacity is unverified.
+defaults:
+  - robodojo_easywam_mot_wan22
+  - _self_
+
+batch_size: 1
+num_workers: 2
+gradient_accumulation_steps: 16
+vae_micro_batch_size: 1
+mixed_precision: bf16
+model:
+  backbone:
+    use_gradient_checkpointing: true
+log_every: 10
+checkpoint_save_limit: 2

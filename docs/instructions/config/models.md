@@ -1,5 +1,7 @@
 # Model Configuration
 
+The development baseline is full-parameter Wan5B/MoT. Other model configurations below are retained research interfaces, not validated RoboDojo results.
+
 [中文](models_zh.md) | [Configuration index](README.md) | [Back to README](../../../README.md)
 
 Model configurations in `configs/model/` select an EasyWAM architecture, a visual backbone, and optional LoRA adapters. Task configurations combine a model with a dataset and training settings. Model names follow `easywam_<architecture>_<backbone>[_lora]`.
@@ -17,10 +19,10 @@ Model configurations in `configs/model/` select an EasyWAM architecture, a visua
 Select an existing task, or override its model group while retaining the dataset and training settings:
 
 ```bash
-python scripts/train.py --cfg job task=libero_easywam_mot_joint_cosmos25
+python scripts/train.py --cfg job task=robodojo_easywam_mot_joint_wan22 model=easywam_mot_joint_cosmos25
 
 python scripts/train.py --cfg job \
-  task=libero_easywam_mot_wan22 \
+  task=robodojo_easywam_mot_wan22 \
   model=easywam_hidden_wan22_lora
 ```
 
@@ -89,7 +91,7 @@ Select a full model recipe for full training, or its `_lora` counterpart for vis
 
 ```bash
 NPROC_PER_NODE=4 bash scripts/train_zero2.sh \
-  task=libero_easywam_mot_wan22 \
+  task=robodojo_easywam_mot_wan22 \
   model=easywam_mot_wan22_lora \
   model.lora.r=64 \
   model.lora.lora_alpha=64

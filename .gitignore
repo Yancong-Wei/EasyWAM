@@ -1,4 +1,6 @@
 # Misc
+# Local research snapshots and archived experiments are not develop core.
+/research/
 outputs/
 tmp/
 /checkpoints/
