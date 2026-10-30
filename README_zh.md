@@ -36,3 +36,5 @@ git diff --check
 主要目录：`configs/` 配方、`src/` 训练与模型、`experiments/robodojo/` 推理和评分、`scripts/robodojo_pipeline.py` 流程入口、`docs/` 使用说明。`data/`、`checkpoints/`、`runs/`、仿真源码/资产与 `research/` 本地资料不纳入开发核心。
 
 清理边界及分支说明见 [开发核心范围](docs/develop_core_zh.md)。对外发布应同时提供权重、训练配置、归一化统计、数据/源码版本和完整评测证据。
+
+研究方案见 [Wan-MoT 改进方向与实验设计](design/robodojo-wan-mot-research.md)。
