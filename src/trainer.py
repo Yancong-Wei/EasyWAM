@@ -311,6 +311,18 @@ class EasyWAMTrainer:
         else:
             raise ValueError("Set `max_steps` or `max_epochs`.")
 
+        save_every_epochs = self.cfg.get("save_every_epochs", None)
+        if not _cfg_none(save_every_epochs):
+            save_every_epochs = float(save_every_epochs)
+            if save_every_epochs <= 0:
+                raise ValueError(
+                    f"`save_every_epochs` must be > 0, got {save_every_epochs}."
+                )
+            self.save_every_epochs = save_every_epochs
+            self.save_every = max(1, math.ceil(save_every_epochs * self.steps_per_epoch))
+        else:
+            self.save_every_epochs = None
+
         logger.info(
             "Train schedule: samples=%d global_batch=%d "
             "(per_device=%d world=%d accum=%d) steps_per_epoch=%d "
@@ -324,6 +336,32 @@ class EasyWAMTrainer:
             self.max_steps,
             self.planned_epochs,
         )
+        if self.save_every_epochs is None:
+            save_desc = f"every {self.save_every} optimizer steps"
+        else:
+            save_desc = (
+                f"every {self.save_every_epochs:g} epochs "
+                f"({self.save_every} optimizer steps)"
+            )
+        logger.info(
+            "This run covers about %.4f epochs. Checkpoint %s, keep %s.",
+            self.planned_epochs,
+            save_desc,
+            "all"
+            if self.checkpoint_save_limit is None
+            else str(self.checkpoint_save_limit),
+        )
+        if (
+            self.save_every_epochs is not None
+            and self.planned_epochs + 1e-9 < self.save_every_epochs
+        ):
+            logger.info(
+                "Periodic checkpoint is beyond this run: first save would be at "
+                "step %d, but max_steps=%d. A final checkpoint is still saved "
+                "when training stops.",
+                self.save_every,
+                self.max_steps,
+            )
 
     def _epoch_progress(self) -> tuple[float, float]:
         current = self.global_step * self.global_batch_size / self.dataset_size
@@ -1172,6 +1210,15 @@ class EasyWAMTrainer:
                 self.epoch += 1
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
+                if self.accelerator.is_main_process:
+                    logger.info(
+                        "Completed epoch %d. global_step=%d planned_epochs=%.4f "
+                        "steps_per_epoch=%d.",
+                        self.epoch,
+                        self.global_step,
+                        self.planned_epochs,
+                        self.steps_per_epoch,
+                    )
                 data_iter = iter(self.train_loader)
                 continue
 

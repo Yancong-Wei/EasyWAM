@@ -14,9 +14,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK = "robodojo_easywam_mot_wan22_a800"
-DATA = ROOT / "data/robodojo-lerobot-v3.0"
-WAN = ROOT / "checkpoints/Wan2.2-TI2V-5B"
-ACTION = ROOT / "checkpoints/ActionDiT_Wan22_5B_alphascale_1024hdim.pt"
+DATA = ROOT / "playground/datasets/robodojo"
+WAN = ROOT / "playground/pretrain_models/Wan2.2-TI2V-5B"
+ACTION = ROOT / "playground/pretrain_models/ActionDiT_Wan22_5B_alphascale_1024hdim.pt"
 SIM_REVISION = "08b7ee46034c3d0c8a389b2b7bfc138f4d55ee4d"
 
 
@@ -219,20 +219,19 @@ def main(argv=None):
     elif args.command in ("probe", "train"):
         if args.gpus < 1 or not args.run_id or Path(args.run_id).name != args.run_id or args.run_id in (".", ".."):
             raise ValueError("Positive GPU count and a single-component run ID are required")
-        output = ROOT / "runs" / TASK / args.run_id
+        output = ROOT / "playground/runs" / TASK / args.run_id
         if output.exists() and not args.resume and not args.dry_run:
             raise FileExistsError(f"Use a new run ID or --resume: {output}")
         if not args.dry_run:
             check_data(); require_completed_download(WAN); require_file(ACTION)
         env.update(NPROC_PER_NODE=str(args.gpus), NNODES="1", NODE_RANK="0", RUN_ID=args.run_id)
-        # Total batch 16 by default across the selected GPU count.
-        if 16 % args.gpus:
-            raise ValueError("GPU count must divide 16; set a custom training recipe otherwise")
-        overrides = [f"task={TASK}", f"gradient_accumulation_steps={16 // args.gpus}"]
-        steps = args.steps if args.steps is not None else (20 if args.command == "probe" else 30000)
-        if steps <= 0:
-            raise ValueError("steps must be positive")
-        overrides += [f"max_steps={steps}"]
+        # Batch size and gradient accumulation come from the task config.
+        overrides = [f"task={TASK}"]
+        steps = args.steps if args.steps is not None else (20 if args.command == "probe" else None)
+        if steps is not None:
+            if steps <= 0:
+                raise ValueError("steps must be positive")
+            overrides += [f"max_steps={steps}"]
         if args.command == "probe":
             overrides += ["eval_every=0", f"save_every={steps}"]
         if args.resume:

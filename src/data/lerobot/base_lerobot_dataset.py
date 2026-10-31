@@ -56,6 +56,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         global_sample_stride: int = 1,
         image_obs_indices: Optional[Sequence[int]] = None,
     ):
+        dataset_dirs = [os.path.normpath(ds_dir) for ds_dir in dataset_dirs]
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
         assert past_obs_size == 0

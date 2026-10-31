@@ -5,13 +5,16 @@ defaults:
   - robodojo_easywam_mot_wan22
   - _self_
 
-batch_size: 1
-num_workers: 2
-gradient_accumulation_steps: 16
-vae_micro_batch_size: 1
+batch_size: 10
+num_workers: 0
+dataloader_pin_memory: false
+gradient_accumulation_steps: 2
+vae_micro_batch_size: null
 mixed_precision: bf16
 model:
   backbone:
-    use_gradient_checkpointing: true
+    use_gradient_checkpointing: false
 log_every: 10
-checkpoint_save_limit: 2
+max_steps: 200000
+save_every_epochs: 1
+checkpoint_save_limit: 3

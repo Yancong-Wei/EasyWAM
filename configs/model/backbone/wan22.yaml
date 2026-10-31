@@ -1,6 +1,6 @@
 name: wan22
-model_id: ./checkpoints/Wan2.2-TI2V-5B
-tokenizer_model_id: ./checkpoints/Wan2.2-TI2V-5B/google/umt5-xxl
+model_id: ./playground/pretrain_models/Wan2.2-TI2V-5B
+tokenizer_model_id: ./playground/pretrain_models/Wan2.2-TI2V-5B/google/umt5-xxl
 tokenizer_max_len: 128
 load_text_encoder: false
 text_encoder_id: wan22ti2v5b
@@ -13,7 +13,7 @@ attn_head_dim: 128
 hidden_dim: 3072
 freq_dim: 256
 video_hidden_layer: 17
-action_dit_pretrained_path: ./checkpoints/ActionDiT_Wan22_5B_alphascale_1024hdim.pt
+action_dit_pretrained_path: ./playground/pretrain_models/ActionDiT_Wan22_5B_alphascale_1024hdim.pt
 
 dit_config:
   has_image_input: false

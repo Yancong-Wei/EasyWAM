@@ -45,7 +45,7 @@ for arg in "${EXTRA_ARGS[@]}"; do
   fi
 done
 
-TRAIN_OUTPUT_DIR="./runs/${TASK_BASENAME}/${RUN_ID}"
+TRAIN_OUTPUT_DIR="./playground/runs/${TASK_BASENAME}/${RUN_ID}"
 mkdir -p "${TRAIN_OUTPUT_DIR}"
 if (( NUM_MACHINES > 1 )); then
   TRAIN_LOG_PATH="${TRAIN_OUTPUT_DIR}/train_node_${MACHINE_RANK}.log"

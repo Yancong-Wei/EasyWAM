@@ -9,7 +9,7 @@
     "allgather_bucket_size": 1e8,
     "offload_optimizer": {
       "device": "cpu",
-      "pin_memory": true
+      "pin_memory": false
     }
   }
 }

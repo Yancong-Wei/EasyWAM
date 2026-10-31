@@ -1,7 +1,7 @@
 name: flux2
 variant: klein-base-4b
-model_path: ./checkpoints/flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors
-ae_model_path: ./checkpoints/flux2/FLUX.2-dev/ae.safetensors
+model_path: ./playground/pretrain_models/flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors
+ae_model_path: ./playground/pretrain_models/flux2/FLUX.2-dev/ae.safetensors
 qwen3_model_spec: Qwen/Qwen3-4B
 qwen3_output_layers: [9, 18, 27]
 tokenizer_max_len: 512

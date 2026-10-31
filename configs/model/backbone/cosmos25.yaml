@@ -1,6 +1,6 @@
 name: cosmos25
-model_id: ./checkpoints/Cosmos-Predict2.5-2B
-reason_model_id: ./checkpoints/Cosmos-Reason1-7B
+model_id: ./playground/pretrain_models/Cosmos-Predict2.5-2B
+reason_model_id: ./playground/pretrain_models/Cosmos-Reason1-7B
 tokenizer_max_len: 128
 load_text_encoder: false
 text_encoder_id: cosmos_reason1_7b
@@ -15,7 +15,7 @@ attn_head_dim: 128
 hidden_dim: 2048
 freq_dim: 2048
 video_hidden_layer: 16
-action_dit_pretrained_path: ./checkpoints/ActionDiT_CosmosPredict25_2B_alphascale_1024hdim.pt
+action_dit_pretrained_path: ./playground/pretrain_models/ActionDiT_CosmosPredict25_2B_alphascale_1024hdim.pt
 
 video_scheduler:
   family: flow_unipc
